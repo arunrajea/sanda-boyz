@@ -41,7 +41,7 @@ window.GAME_TITLE = 'SANDA BOYZ';
 
 window.ROSTER = [
   // ---- men ----
-  { name: 'ARUN', title: 'The Hothead',      gender: 'm', costume: 'gi',       shirt: '#f5f5f5', pants: '#f5f5f5', accent: '#d32f2f', skin: '#9a6a48', hair: '#17110d', hairStyle: 'none', speed: 3, power: 3, health: 3, face: { hair: 'short', glasses: 'thick', beard: 'stubble', smile: 'teeth' }, special: 'fireball', ultimate: 'dragon', winSay: 'Gomma' },
+  { name: 'ARUN', title: 'The Hothead',      gender: 'm', costume: 'gi',       shirt: '#f5f5f5', pants: '#f5f5f5', accent: '#d32f2f', skin: '#9a6a48', hair: '#17110d', hairStyle: 'none', speed: 3, power: 3, health: 3, face: { hair: 'short', glasses: 'thick', beard: 'stubble', smile: 'teeth' }, special: 'fireball', ultimate: 'dragon', winSay: 'Gommmaaa yaaru kitta' },
   { name: 'ARUZ', title: 'The Immovable',    gender: 'm', costume: 'boxer',    shirt: '#5d4037', pants: '#1565c0', accent: '#e53935', skin: '#a5704c', hair: '#17110d', hairStyle: 'none', build: 1.2, speed: 1, power: 4, health: 5, face: { hair: 'messy', beard: 'goatee', moustache: 'thin' }, special: 'quake' },
   { name: 'VICKY', title: 'Strikes First',    gender: 'm', costume: 'ninja',    shirt: '#1b1b2f', pants: '#1b1b2f', accent: '#c6ff00', skin: '#8a5a3c', hair: '#17110d', hairStyle: 'none', build: .95, speed: 5, power: 2, health: 2, face: { hair: 'quiff', beard: 'short', moustache: 1 }, special: 'dash' },
   { name: 'POPU', title: 'Unstoppable',      gender: 'm', costume: 'commando', shirt: '#4b5320', pants: '#6b6b47', accent: '#ff7043', skin: '#a06a40', hair: '#17110d', hairStyle: 'none', build: 1.12, speed: 2, power: 4, health: 4, face: { hair: 'quiff', glasses: 'thin', beard: 'short', moustache: 1, smile: 'teeth' }, special: 'dash' },

@@ -6,7 +6,7 @@ const W = 960, H = 540, GROUND = 468;
 const cv = document.getElementById('game'), ctx = cv.getContext('2d');
 const ROSTER = window.ROSTER, TITLE = window.GAME_TITLE || 'SANDA BOYZ';
 const FONT = 'Impact, "Arial Black", sans-serif';
-const BUILD = 'version 16';   // shown on the title screen so you can tell which copy is loaded
+const BUILD = 'version 17';   // shown on the title screen so you can tell which copy is loaded
 const rand = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -1850,9 +1850,9 @@ function renderFight() {
   });
   F.f.forEach(f => {                             // the winner's line, in a speech bubble
     if (f.state !== 'win' || !f.winPose || !f.def.winSay || f.stateT > 220) return;
-    const line = f.def.winSay.toUpperCase() + '!', bx = clamp(f.x + f.facing * 78, 90, W - 90), by = f.y - 252;
+    const line = f.def.winSay.toUpperCase() + '!', by = f.y - 252;
     ctx.font = `26px ${FONT}`;
-    const bw = ctx.measureText(line).width + 30;
+    const bw = ctx.measureText(line).width + 30, bx = clamp(f.x + f.facing * 78, bw / 2 + 10, W - bw / 2 - 10);   // keep the whole bubble on screen
     ctx.lineWidth = 3; ctx.strokeStyle = '#111'; ctx.lineJoin = 'round'; ctx.fillStyle = '#fff';
     ctx.beginPath(); ctx.moveTo(bx - 10, by + 14); ctx.lineTo(f.x + f.facing * 24, f.y - 200); ctx.lineTo(bx + 12, by + 14); ctx.closePath(); ctx.fill(); ctx.stroke();
     rrect(bx - bw / 2, by - 22, bw, 44, 14); ctx.fillStyle = '#fff'; ctx.fill(); ctx.stroke();
