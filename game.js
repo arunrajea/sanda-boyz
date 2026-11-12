@@ -568,6 +568,7 @@ function relayConn(client, pub) {
   return { relay: true, client, send(o) { client.publish(pub, typeof o === 'string' ? o : JSON.stringify(o), { qos: 0 }); }, close() { endClient(client); } };
 }
 function netClose() {
+  voiceStop();
   const p = net.peer, c = net.conn, rs = net.relays, gs = net.guests;
   net.joinId++; net.peer = null; net.conn = null; net.role = null; net.guests = []; net.relays = [];
   net.evD = []; net.evR = []; net.ids = ['h']; net.myId = 'h';
@@ -577,6 +578,84 @@ function netClose() {
   if (p) { try { p.destroy(); } catch (e) { /* already gone */ } }
 }
 function netFail(m) { netClose(); fight = null; net.ui = 'error'; net.msg = m; G.scene = 'online'; }
+
+/* ---- voice chat ---- */
+// Every pair of players with a direct link shares an audio call. Everyone can listen;
+// the microphone button decides whether your own voice is sent. Players on the relay
+// have no direct link, so they cannot take part in voice.
+const voice = { tick: 0, on: false, mic: null, silent: null, calls: {}, tries: {}, err: '' };
+const micBtn = document.getElementById('mic');
+const voiceBase = () => ROOM + net.code;
+function outStream() {
+  if (voice.on && voice.mic) return voice.mic;
+  if (!voice.silent) { audio(); if (!AC) return null; voice.silent = AC.createMediaStreamDestination().stream; }   // a silent track: listen only
+  return voice.silent;
+}
+function dropCall(id) {
+  const c = voice.calls[id];
+  if (!c) return;
+  delete voice.calls[id];
+  try { c.call.close(); } catch (e) { /* already closed */ }
+  if (c.el) { c.el.srcObject = null; c.el = null; }
+}
+function attachCall(call, id) {
+  dropCall(id);
+  const c = voice.calls[id] = { call, t0: now(), live: false, el: null };
+  call.on('stream', st => {
+    if (voice.calls[id] !== c) return;
+    c.live = true;
+    if (!c.el) { c.el = new Audio(); c.el.autoplay = true; }
+    c.el.srcObject = st; c.el.play().catch(() => {});
+  });
+  const gone = () => { if (voice.calls[id] === c) dropCall(id); };
+  call.on('close', gone); call.on('error', gone);
+}
+function onCall(call) {
+  const base = voiceBase(), id = call.peer === base ? 'h' : call.peer.startsWith(base + '-') ? call.peer.slice(base.length + 1) : null;
+  const st = outStream();
+  if (!id || !st) return shut(call);
+  call.answer(st); attachCall(call, id);
+}
+// Keep one call open with every other player in the room.
+function voiceSync() {
+  const p = net.peer;
+  if (!p || p.destroyed || !p.open) return;
+  const ids = (net.role === 'host' ? lobbyIds() : net.ids).filter(i => i !== net.myId);
+  for (const id in voice.calls) if (!ids.includes(id)) dropCall(id);
+  for (const id of ids) {
+    const c = voice.calls[id];
+    if (c) { if (!c.live && now() - c.t0 > 9000) dropCall(id); continue; }
+    if (net.myId < id && (voice.tries[id] || 0) < 4) {       // the "smaller" id places the call, so each pair gets exactly one
+      const st = outStream();
+      if (!st) return;
+      voice.tries[id] = (voice.tries[id] || 0) + 1;
+      const call = p.call(voiceBase() + (id === 'h' ? '' : '-' + id), st);
+      if (call) attachCall(call, id);
+    }
+  }
+}
+function sendTrack() {
+  const st = outStream(), t = st && st.getAudioTracks()[0];
+  if (!t) return;
+  for (const id in voice.calls) {
+    const pc = voice.calls[id].call.peerConnection;
+    if (pc) pc.getSenders().forEach(sn => { if (!sn.track || sn.track.kind === 'audio') sn.replaceTrack(t).catch(() => {}); });
+  }
+}
+async function toggleMic() {
+  if (!net.role || !net.peer) return;
+  if (voice.on) { voice.on = false; sendTrack(); return; }
+  try {
+    if (!voice.mic) voice.mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    voice.on = true; voice.err = ''; sendTrack();
+  } catch (e) { voice.err = 'MICROPHONE BLOCKED'; }
+}
+function voiceStop() {
+  for (const id in voice.calls) dropCall(id);
+  if (voice.mic) { voice.mic.getTracks().forEach(t => t.stop()); voice.mic = null; }
+  voice.on = false; voice.tries = {}; voice.err = '';
+}
+if (micBtn) micBtn.addEventListener('pointerup', e => { e.preventDefault(); toggleMic(); });
 
 /* ---- host side ---- */
 function addGuest(id, kind, conn, client) {
@@ -623,6 +702,7 @@ function hostGame() {
     if (net.joinId !== id) return;
     const p = net.peer = new window.Peer(ROOM + code);
     p.on('open', ready);
+    p.on('call', onCall);
     p.on('connection', c => c.on('open', () => {
       if (net.joinId !== id) return shut(c);
       const g = addGuest((c.metadata && c.metadata.id) || uid(), 'direct', c, null);
@@ -656,7 +736,7 @@ function hostGame() {
 // particles are worked out on each screen instead of being sent.
 function snapshot(ev) {
   const F = fight;
-  return { t: 's', pk: pkIdx(), ids: F.pid, ev,
+  return { t: 's', pk: pkIdx(), ids: F.pid, lob: lobbyIds(), ev,
     F: { round: F.round, phase: F.phase, timer: F.timer, tick: F.tick, stage: F.stage, banner: F.banner, menu: F.menu, shake: F.shake, wins: F.wins, hitstop: F.hitstop },
     f: F.f.map(f => ({ x: f.x, y: f.y, vx: f.vx, vy: f.vy, facing: f.facing, state: f.state, stateT: f.stateT, mv: f.move ? f.move.name : 0,
       hp: f.hp, energy: f.energy, alpha: f.alpha, flash: f.flash, combo: f.combo, crouchB: +f.crouchB, threat: +f.threat, walkT: f.walkT })),
@@ -723,7 +803,8 @@ function joinGame(code) {
   };
   loadPeer(() => {                                            // try the direct link first
     if (!live() || relayStarted) return;
-    const p = net.peer = new window.Peer();
+    const p = net.peer = new window.Peer(ROOM + code + '-' + gid);
+    p.on('call', onCall);
     p.on('open', () => {
       if (net.peer !== p) return;
       const c = p.connect(ROOM + code, { reliable: true, serialization: 'json', metadata: { id: gid } });
@@ -756,6 +837,7 @@ function onData(m) {
   net.lastRx = now();
   if (m.t === 'full') return netFail('That room is full (6 players).');
   if (m.pk) G.picks = m.pk.map(i => ROSTER[i]);
+  if (m.lob) net.ids = m.lob;
   if (m.t === 'g') { G.scene = m.scene; G.t = m.T; G.cd = m.cd; G.sel = m.sel; net.ids = m.ids; fight = null; }
   else if (m.t === 's' && m.pk) {
     const key = m.pk.join() + '|' + m.ids.join();
@@ -1032,6 +1114,8 @@ function updateSelect() {
 }
 function update() {
   const typing = G.scene === 'online' && net.ui === 'typing', both = [K1, K2];
+  if (pressed.KeyT && !typing) toggleMic();
+  if (net.role && net.peer && ++voice.tick % 60 === 0) voiceSync();
   if (pressed.KeyM && !typing) { muted = !muted; if (muted && window.speechSynthesis) speechSynthesis.cancel(); }
   if (net.role === 'guest' && net.conn) {
     if (now() - net.lastRx > 15000) netFail('The connection to the host was lost.');
@@ -1481,6 +1565,7 @@ function renderOnline() {
     ['HOST A GAME', 'JOIN A GAME'].forEach((o, i) => text((i === net.menu ? '▶ ' : '') + o, W / 2, 220 + i * 56, 38, i === net.menu ? '#fff' : '#9a8fa8'));
     small('One player hosts and shares the room code. Up to 5 friends join with it.', 370);
     small('2 players is a one-on-one fight. 3 to 6 players is a free-for-all brawl.', 398);
+    small(touch ? 'Voice chat: tap the microphone button once you are in a room.' : 'Voice chat: press T or click the microphone button once you are in a room.', 426);
     small(touch ? 'LP to choose  ·  ☰ to go back' : 'ENTER to choose  ·  ESC to go back', 500);
   } else if (net.ui === 'wait') {
     text(net.msg + ' '.repeat((performance.now() / 400 | 0) % 3), W / 2, 260, 30, '#fff');
@@ -1658,8 +1743,17 @@ function render() {
     case 'champion': renderChampion(); break;
   }
   if (muted) text('MUTED', W - 12, H - 60, 14, '#f66', 'right');
-  if (net.role === 'guest' && net.conn) text(net.via === 'relay' ? 'ONLINE · RELAY' : 'ONLINE · DIRECT', W / 2, H - 9, 11, '#9a9', 'center', null);
-  else if (net.role === 'host' && net.guests.length) text(`ONLINE · HOST · ${net.guests.length + 1} PLAYERS`, W / 2, H - 9, 11, '#9a9', 'center', null);
+  const linked = net.role === 'guest' ? !!net.conn : net.role === 'host' && net.guests.length > 0, canTalk = linked && !!net.peer;
+  if (micBtn) {
+    if (micBtn.hidden === canTalk) micBtn.hidden = !canTalk;
+    micBtn.classList.toggle('on', voice.on);
+  }
+  if (linked) {
+    const heard = Object.values(voice.calls).filter(c => c.live).length;
+    const v = !canTalk ? 'VOICE NEEDS A DIRECT LINK' : voice.err || (voice.on ? 'MIC ON' : touch ? 'MIC OFF' : 'MIC OFF (T)') + ` · ${heard} VOICE LINK${heard === 1 ? '' : 'S'}`;
+    const who = net.role === 'guest' ? (net.via === 'relay' ? 'RELAY' : 'DIRECT') : `HOST · ${net.guests.length + 1} PLAYERS`;
+    text(`ONLINE · ${who} · ${v}`, W / 2, H - 9, 11, voice.on ? '#c6ff00' : '#9a9', 'center', null);
+  }
 }
 
 /* ------------------------------------------------------------------- loop */
@@ -1673,7 +1767,7 @@ function frame(t) {
 requestAnimationFrame(frame);
 
 // debugging hooks (used for automated testing)
-window.__game = { G, net, get fight() { return fight; }, keys, pressed, update, render, startFight, drawFighter, hostGame, joinGame, ROSTER };
+window.__game = { G, net, get fight() { return fight; }, keys, pressed, update, render, startFight, drawFighter, hostGame, joinGame, voice, ROSTER };
 
 // An invite link (…?join=ABCD) drops the friend straight into the room.
 const invite = new URLSearchParams(location.search).get('join');
