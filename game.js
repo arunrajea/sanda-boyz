@@ -153,7 +153,7 @@ function say(t) { if (net.role === 'guest') return; sayRaw(t); record(['say', t]
 
 /* ------------------------------------------------------------------ poses */
 // Angles are measured from "straight down"; positive swings toward the opponent.
-const LEG = 40, TORSO = 58, ARM = 30, HEAD = 22;
+const LEG = 40, TORSO = 58, ARM = 30, HEAD = 26;
 const CL = { lf: [1.25, -.2], lb: [.55, -1.1] };   // crouching legs
 const P = {
   idle:   { lean: .12, af: [.7, 2.4], ab: [.35, 2.2], lf: [.38, -.02], lb: [-.25, -.6] },
@@ -1535,7 +1535,7 @@ function renderFight() {
   }
   if (brawl) F.f.forEach((f, i) => {            // name tag over each fighter so you can find yourself in the crowd
     if (f.hp <= 0) return;
-    text(i === me ? '▼ YOU' : f.def.name, f.x, f.y - 204, i === me ? 15 : 12, i === me ? '#ffd23f' : PCOL[i]);
+    text(i === me ? '▼ YOU' : f.def.name, f.x, f.y - 214, i === me ? 15 : 12, i === me ? '#ffd23f' : PCOL[i]);
   });
   F.proj.forEach(drawProj);
   for (const s of F.sparks) {
