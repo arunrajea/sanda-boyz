@@ -41,7 +41,8 @@ addEventListener('keydown', e => {
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-cv.addEventListener('pointerdown', () => { audio(); if (G.scene === 'online' && net.ui === 'hosting') shareInvite(); });
+cv.addEventListener('pointerdown', audio);
+cv.addEventListener('pointerup', () => { if (G.scene === 'online' && net.ui === 'hosting') shareInvite(); });
 
 /* --------------------------------------------------------- touch controls */
 // On-screen pad and buttons simply press the same keys as Player 1's keyboard.
@@ -71,12 +72,17 @@ for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) padEl.add
   if (e.pointerId !== padId) return;
   padId = null; ['KeyA', 'KeyD', 'KeyW', 'KeyS'].forEach(release); stickEl.style.transform = '';
 });
-document.getElementById('fs').addEventListener('click', () => {
+document.getElementById('fs').addEventListener('pointerup', () => {
   const el = document.documentElement;
   if (document.fullscreenElement) document.exitFullscreen();
   else if (el.requestFullscreen) el.requestFullscreen().then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape').catch(() => {})).catch(() => {});
 });
 addEventListener('contextmenu', e => e.preventDefault());
+// Stop the phone browser's own gestures (double-tap zoom, pinch zoom, page drag) from
+// hijacking fast button presses. The room-code box keeps normal behaviour so it can be typed in.
+const inCodeBox = e => e.target && e.target.closest && e.target.closest('#codebox');
+for (const ev of ['touchstart', 'touchmove', 'touchend']) document.addEventListener(ev, e => { if (!inCodeBox(e) && e.cancelable) e.preventDefault(); }, { passive: false });
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend', 'dblclick']) document.addEventListener(ev, e => e.preventDefault(), { passive: false });
 codeIn.addEventListener('input', () => { codeIn.value = net.code = codeIn.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4); });
 codeBox.addEventListener('submit', e => { e.preventDefault(); if (net.code.length === 4) { codeIn.blur(); joinGame(net.code); } });
 
