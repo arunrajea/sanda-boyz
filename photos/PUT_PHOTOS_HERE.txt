@@ -1,2 +1,0 @@
-Drop face photos here (square crops work best), e.g. photos/arun.jpg,
-then set  photo: 'photos/arun.jpg'  for that fighter in roster.js.
