@@ -15,7 +15,13 @@ ROSTER.forEach(d => {
   if (d.photo) { const im = new Image(); im.onload = () => { d.img = im; }; im.src = d.photo; }
 });
 
+const shadeCache = new Map();
 function shade(hex, k) {
+  const key = hex + k; let v = shadeCache.get(key);
+  if (!v) { v = shadeRaw(hex, k); shadeCache.set(key, v); }
+  return v;
+}
+function shadeRaw(hex, k) {
   const n = parseInt(hex.slice(1), 16);
   const f = c => clamp(Math.round(k < 0 ? c * (1 + k) : c + (255 - c) * k), 0, 255);
   return `rgb(${f(n >> 16)},${f((n >> 8) & 255)},${f(n & 255)})`;
@@ -142,8 +148,8 @@ function sayRaw(t) {
 }
 // Online: the host plays sounds and forwards them; the guest only plays what the host sends.
 const sfxRaw = Object.assign({}, sfx);
-for (const k in sfx) sfx[k] = a => { if (net.role === 'guest') return; sfxRaw[k](a); if (net.role === 'host') net.ev.push([k, a]); };
-function say(t) { if (net.role === 'guest') return; sayRaw(t); if (net.role === 'host') net.ev.push(['say', t]); }
+for (const k in sfx) sfx[k] = a => { if (net.role === 'guest') return; sfxRaw[k](a); record([k, a]); };
+function say(t) { if (net.role === 'guest') return; sayRaw(t); record(['say', t]); }
 
 /* ------------------------------------------------------------------ poses */
 // Angles are measured from "straight down"; positive swings toward the opponent.
@@ -241,20 +247,22 @@ for (const k in MOVES) MOVES[k].name = k;
 for (const k in SPECIALS) SPECIALS[k].name = k;
 
 /* ---------------------------------------------------------------- fighter */
-function mkFighter(def, side) {
+// A fight holds 2 to 6 fighters. n = how many are in this fight.
+function mkFighter(def, side, n = 2) {
   const hp = 70 + def.health * 10;
-  return { def, side, x: side ? 660 : 300, y: GROUND, vx: 0, vy: 0, facing: side ? -1 : 1,
+  const x = n === 2 ? (side ? 660 : 300) : 100 + side * (760 / (n - 1));
+  return { def, side, x, y: GROUND, nx: x, ny: GROUND, vx: 0, vy: 0, facing: x < W / 2 ? 1 : -1,
     speed: 3 + def.speed * .5, power: .7 + def.power * .1, maxHp: hp, hp, lagHp: hp, energy: 50,
-    state: 'idle', stateT: 0, move: null, hitDone: false, stun: 0, invuln: 0, alpha: 1,
+    state: 'idle', stateT: 0, move: null, hits: [], stun: 0, invuln: 0, alpha: 1,
     combo: 0, comboT: 0, buf: null, inp: EMPTY, backHeld: false, threat: false, crouchB: false,
-    walkT: 0, downT: 0, flash: 0, pose: clonePose(P.idle) };
+    walkT: 0, downT: 0, flash: 0, fresh: true, gone: false, out: false, tgt: null, pose: clonePose(P.idle) };
 }
 const controllable = f => f.state === 'idle' || f.state === 'walk' || f.state === 'crouch' || f.state === 'block';
 const isCrouch = f => f.state === 'crouch' || (f.state === 'block' && f.crouchB) || (f.state === 'attack' && f.move.duck && f.y >= GROUND);
 function setState(f, s) { if (f.state !== s) { f.state = s; f.stateT = 0; } f.alpha = 1; }
 function startMove(f, name) {
   const m = MOVES[name] || SPECIALS[name];
-  f.state = 'attack'; f.stateT = 0; f.move = m; f.hitDone = false; f.buf = null;
+  f.state = 'attack'; f.stateT = 0; f.move = m; f.hits = []; f.buf = null;
   if (f.y >= GROUND) f.vx = 0;
   if (m.special) { sfx.special(); burst(f.x, f.y - 90, f.def.accent, 8); } else sfx.swing();
 }
@@ -262,15 +270,26 @@ function hurtBox(f) {
   const h = isCrouch(f) ? 100 : f.y < GROUND ? 140 : 165;
   return { x1: f.x - 24, x2: f.x + 24, y1: f.y - h, y2: f.y };
 }
-function threatTo(f, o) {
-  if (o.state === 'attack' && Math.abs(o.x - f.x) < 260) return true;
+// The fighter each one faces: the closest opponent still standing.
+function nearest(f) {
+  let best = null, bd = 1e9;
+  for (const o of fight.f) {
+    if (o === f) continue;
+    const d = Math.abs(o.x - f.x) + (o.hp <= 0 ? 5000 : 0);
+    if (d < bd) { bd = d; best = o; }
+  }
+  return best;
+}
+function threatTo(f) {
+  if (fight.f.some(o => o !== f && o.state === 'attack' && Math.abs(o.x - f.x) < 260)) return true;
   return fight.proj.some(p => p.owner !== f && Math.abs(p.x - f.x) < 220);
 }
 
 function applyHit(att, def, m, dir, px, py) {
   if (def.invuln > 0 || def.state === 'down' || def.state === 'getup') return false;
   const cr = isCrouch(def);
-  const canBlock = controllable(def) && def.backHeld && def.y >= GROUND &&
+  // blocking only works against attacks coming from the front
+  const canBlock = controllable(def) && def.backHeld && def.y >= GROUND && dir * def.facing < 0 &&
     (m.h === 'low' ? cr : m.h === 'over' ? !cr : true);
   if (canBlock) {
     def.hp = Math.max(1, def.hp - m.dmg * .08);
@@ -292,10 +311,11 @@ function applyHit(att, def, m, dir, px, py) {
     // cornered defender: push the attacker back instead so jabs can't loop forever
     if ((dir > 0 && def.x > W - 70) || (dir < 0 && def.x < 70)) att.vx = -dir * m.kb;
   }
-  const heavy = m.dmg > 9;
-  fight.hitstop = heavy ? 9 : 5; fight.shake = heavy ? 10 : 4;
-  sfx.hit(heavy); burst(px, py, heavy ? att.def.accent : '#fff', heavy ? 16 : 9);
-  fight.sparks.push({ ring: true, x: px, y: py, life: 12, max: 12, color: '#fff', size: heavy ? 46 : 28 });
+  const heavy = m.dmg > 9, brawl = fight.n > 2;
+  // the brief freeze on impact is kept very short in a brawl so six fighters don't stutter
+  fight.hitstop = Math.max(fight.hitstop, brawl ? (heavy ? 3 : 1) : (heavy ? 7 : 4));
+  fight.shake = Math.max(fight.shake, heavy ? 10 : 4);
+  sfx.hit(heavy); burst(px, py, heavy ? att.def.accent : '#fff', heavy ? 14 : 8); ring(px, py, heavy ? 46 : 28);
   return true;
 }
 
@@ -317,7 +337,7 @@ function updateFighter(f, o) {
     else {
       f.facing = o.x >= f.x ? 1 : -1;
       const fwd = f.facing > 0 ? inp.r : inp.l, back = f.facing > 0 ? inp.l : inp.r;
-      f.backHeld = back; f.threat = back && threatTo(f, o);
+      f.backHeld = back; f.threat = back && threatTo(f);
       if (want === 's') { f.energy -= 50; startMove(f, f.def.special); }
       else if (want) startMove(f, (inp.d ? DUCK : STAND)[want]);
       else if (inp.u) {
@@ -338,12 +358,16 @@ function updateFighter(f, o) {
     const m = f.move, t = f.stateT;
     if (m.frame) m.frame(f, o);
     if (f.y >= GROUND && !m.keepVx) f.vx *= .7;
-    if (m.reach && t >= m.su && t < m.su + m.ac && !f.hitDone) {
+    if (m.reach && t >= m.su && t < m.su + m.ac) {
       const x1 = Math.min(f.x, f.x + f.facing * m.reach), x2 = Math.max(f.x, f.x + f.facing * m.reach);
-      const y1 = f.y + m.hy - m.hh / 2, y2 = f.y + m.hy + m.hh / 2, hb = hurtBox(o);
-      if (x1 < hb.x2 && x2 > hb.x1 && y1 < hb.y2 && y2 > hb.y1) {
-        const px = clamp(f.x + f.facing * m.reach, hb.x1, hb.x2), py = clamp((y1 + y2) / 2, hb.y1 + 10, hb.y2 - 10);
-        if (applyHit(f, o, m, f.facing, px, py)) f.hitDone = true;
+      const y1 = f.y + m.hy - m.hh / 2, y2 = f.y + m.hy + m.hh / 2;
+      for (const d of fight.f) {                       // an attack can catch every opponent in reach, once each
+        if (d === f || f.hits.includes(d.side)) continue;
+        const hb = hurtBox(d);
+        if (x1 < hb.x2 && x2 > hb.x1 && y1 < hb.y2 && y2 > hb.y1) {
+          const px = clamp(f.x + f.facing * m.reach, hb.x1, hb.x2), py = clamp((y1 + y2) / 2, hb.y1 + 10, hb.y2 - 10);
+          if (applyHit(f, d, m, f.facing, px, py)) f.hits.push(d.side);
+        }
       }
     }
     if (f.state === 'attack' && !m.air && t >= m.su + m.ac + m.rc && f.y >= GROUND) setState(f, 'idle');
@@ -384,7 +408,7 @@ function targetPose(f) {
     case 'crouch': return f.threat ? P.cblock : P.crouch;
     case 'block': return f.crouchB ? P.cblock : P.block;
     case 'jump': return P.jump;
-    case 'attack': return P[f.stateT < f.move.su ? (f.move.pre || f.move.pose) : f.move.pose];
+    case 'attack': return f.move ? P[f.stateT < f.move.su ? (f.move.pre || f.move.pose) : f.move.pose] : P.idle;
     case 'hit': return P.hit;
     case 'down': return f.y < GROUND ? P.fall : P.lying;
     case 'getup': return P.crouch;
@@ -406,9 +430,12 @@ function updateProj() {
   for (const p of F.proj) {
     p.x += p.vx; p.t++; p.life--;
     if (p.x < -40 || p.x > W + 40) p.life = 0;
-    const o = F.f[1 - p.owner.side], hb = hurtBox(o);
-    if (p.life > 0 && p.x - p.r < hb.x2 && p.x + p.r > hb.x1 && p.y - p.r < hb.y2 && p.y + p.r > hb.y1) {
-      if (applyHit(p.owner, o, p.m, Math.sign(p.vx), p.x, p.y)) p.life = 0;
+    for (const o of F.f) {
+      if (o === p.owner || p.life <= 0) continue;
+      const hb = hurtBox(o);
+      if (p.x - p.r < hb.x2 && p.x + p.r > hb.x1 && p.y - p.r < hb.y2 && p.y + p.r > hb.y1) {
+        if (applyHit(p.owner, o, p.m, Math.sign(p.vx), p.x, p.y)) p.life = 0;
+      }
     }
   }
   for (const a of F.proj) for (const b of F.proj) {
@@ -418,13 +445,19 @@ function updateProj() {
   }
   F.proj = F.proj.filter(p => p.life > 0);
 }
-function burst(x, y, color, n) {
+// Hit sparks. Online, the host only tells the other players "a burst happened here";
+// each screen draws its own particles, which keeps the messages small.
+function spawnBurst(x, y, color, n) {
   if (!fight) return;
+  if (fight.sparks.length > 140) return;
   for (let i = 0; i < n; i++) {
     const a = rand(Math.PI * 2), s = rand(2, 8);
     fight.sparks.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1, life: rand(10, 22) | 0, max: 22, color, size: rand(2, 5) });
   }
 }
+function spawnRing(x, y, size) { if (fight) fight.sparks.push({ ring: true, x, y, life: 12, max: 12, color: '#fff', size }); }
+function burst(x, y, color, n) { record(['b', x | 0, y | 0, color, n]); spawnBurst(x, y, color, n); }
+function ring(x, y, size) { record(['r', x | 0, y | 0, size]); spawnRing(x, y, size); }
 function updateSparks() {
   for (const s of fight.sparks) { if (!s.ring) { s.x += s.vx; s.y += s.vy; s.vy += .3; } s.life--; }
   fight.sparks = fight.sparks.filter(s => s.life > 0);
@@ -492,28 +525,35 @@ function aiInput(f, o, ai) {
 
 /* ------------------------------------------------------------ game state */
 const DIFF = ['EASY', 'NORMAL', 'HARD'];
-const G = { scene: 'title', mode: 'arcade', diff: 1, menu: 0, t: 0, sel: { c: [0, 4], lock: [false, false] }, ladder: [], ladderI: 0, picks: [null, null] };
+const MAXP = 6;                                                  // most players in one online brawl
+const PCOL = ['#ff6b6b', '#5ee7ff', '#c6ff00', '#ffb74d', '#ea80fc', '#ffffff'];   // player colours
+// sel.c / sel.lock / picks / pids all have one entry per player.
+const G = { scene: 'title', mode: 'arcade', diff: 1, menu: 0, t: 0, cd: 0, sel: { c: [0, 4], lock: [false, false] },
+            ladder: [], ladderI: 0, picks: [null, null], pids: ['p1', 'p2'] };
 let fight = null;
 
 /* ----------------------------------------------------------------- online */
-// Peer-to-peer over WebRTC (PeerJS). The host runs the game and streams the
-// state; the guest sends its key presses and draws what the host sends.
+// One player hosts and runs the game. Up to five friends join; each sends its
+// button presses to the host and draws what the host sends back.
+// Two links are used: a direct browser-to-browser link (fast), and a public
+// relay for players whose network blocks the direct link (mobile data etc).
 const EDGES = ['lp', 'rp', 'lk', 'rk', 's', 'nl', 'nr', 'nu', 'nd', 'ok'];
 const NOREMOTE = () => ({ l: 0, r: 0, u: 0, d: 0, lp: 0, rp: 0, lk: 0, rk: 0, s: 0, nl: 0, nr: 0, nu: 0, nd: 0, ok: 0 });
-const net = { role: null, peer: null, conn: null, ui: 'menu', menu: 0, code: '', msg: '', ev: [], remote: NOREMOTE(), lastSent: '', copied: 0, relays: [], joinId: 0, connT: 0, lastRx: 0, via: '', tick: 0 };
-const ROOM = 'buddybrawl-v2-';
-const rnav = () => ({ up: net.remote.nu, down: net.remote.nd, left: net.remote.nl, right: net.remote.nr, ok: net.remote.ok });
-// Two ways to link the players: a direct browser-to-browser link (fast), and a
-// fallback that passes messages through a public relay when the direct link
-// cannot get through (mobile data, strict routers).
+const net = { role: null, peer: null, conn: null, guests: [], relays: [], myId: 'h', ids: ['h'], ui: 'menu', menu: 0, code: '', msg: '',
+              evD: [], evR: [], lastSent: '', copied: 0, joinId: 0, lastRx: 0, via: '', tick: 0 };
+const ROOM = 'sandaboyz-v3-';
 const PEER_LIB = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
 const MQTT_LIB = 'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js';
 const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
-const topic = (code, dir) => `sandaboyz/v2/${code}/${dir}`;
+const topic = (code, dir) => `sandaboyz/v3/${code}/${dir}`;
 const round2 = (k, v) => typeof v === 'number' ? Math.round(v * 100) / 100 : v;
 const now = () => performance.now();
 const parse = raw => { try { return JSON.parse(raw.toString()); } catch (e) { return null; } };
 const uid = () => (Math.random() * 1e9 | 0).toString(36);
+const lobbyIds = () => ['h', ...net.guests.map(g => g.id)];
+const pkIdx = () => G.picks.length && G.picks.every(Boolean) ? G.picks.map(d => ROSTER.indexOf(d)) : null;
+// Sounds and sparks the host produced this tick, to be replayed on every other screen.
+function record(e) { if (net.role === 'host' && net.guests.length) { net.evD.push(e); net.evR.push(e); } }
 function loadScript(url, ready, cb, fail) {
   if (ready()) return cb();
   const s = document.createElement('script');
@@ -523,30 +563,76 @@ function loadScript(url, ready, cb, fail) {
 const loadPeer = (cb, fail) => loadScript(PEER_LIB, () => !!window.Peer, cb, fail);
 const loadMqtt = (cb, fail) => loadScript(MQTT_LIB, () => !!window.mqtt, cb, fail);
 const endClient = c => { try { c.end(true); } catch (e) { /* already closed */ } };
+const shut = c => { try { c.close(); } catch (e) { /* already closed */ } };
 function relayConn(client, pub) {
-  return { relay: true, client, send(o) { client.publish(pub, JSON.stringify(o, round2), { qos: 0 }); }, close() { endClient(client); } };
+  return { relay: true, client, send(o) { client.publish(pub, typeof o === 'string' ? o : JSON.stringify(o), { qos: 0 }); }, close() { endClient(client); } };
 }
 function netClose() {
-  const p = net.peer, c = net.conn, rs = net.relays;
-  net.joinId++; net.peer = null; net.conn = null; net.role = null; net.ev = []; net.remote = NOREMOTE(); net.relays = [];
-  if (c) { try { c.close(); } catch (e) { /* already closed */ } }
+  const p = net.peer, c = net.conn, rs = net.relays, gs = net.guests;
+  net.joinId++; net.peer = null; net.conn = null; net.role = null; net.guests = []; net.relays = [];
+  net.evD = []; net.evR = []; net.ids = ['h']; net.myId = 'h';
+  if (c) shut(c);
+  gs.forEach(g => { if (g.conn) shut(g.conn); });
   rs.forEach(endClient);
   if (p) { try { p.destroy(); } catch (e) { /* already gone */ } }
 }
 function netFail(m) { netClose(); fight = null; net.ui = 'error'; net.msg = m; G.scene = 'online'; }
+
+/* ---- host side ---- */
+function addGuest(id, kind, conn, client) {
+  let g = net.guests.find(x => x.id === id);
+  if (g) {                                   // the same player switching from the direct link to the relay
+    if (g.conn && g.conn !== conn) { const old = g.conn; g.conn = null; shut(old); }
+    g.kind = kind; g.conn = conn; g.client = client; g.lastRx = now();
+    return g;
+  }
+  if (net.guests.length >= MAXP - 1) return null;
+  g = { id, kind, conn, client, remote: NOREMOTE(), lastRx: now() };
+  net.guests.push(g); sfxRaw.ok();
+  if (G.scene === 'online') gotoSelect();                                  // first friend arrived: open the lobby
+  else if (G.scene === 'select') { G.sel.c.push((net.guests.length * 3) % ROSTER.length); G.sel.lock.push(false); G.cd = 0; }
+  return g;                                  // joined mid-fight: they watch, and play from the next character select
+}
+function removeGuest(g) {
+  const i = net.guests.indexOf(g);
+  if (i < 0) return;
+  net.guests.splice(i, 1);
+  if (g.conn) { const c = g.conn; g.conn = null; shut(c); }
+  if (G.scene === 'select') { G.sel.c.splice(i + 1, 1); G.sel.lock.splice(i + 1, 1); G.cd = 0; }
+  if (!net.guests.length && (G.scene === 'select' || G.scene === 'vs')) { G.scene = 'online'; net.ui = 'hosting'; }
+}
+function guestMsg(g, m) {
+  if (typeof m === 'string') m = parse(m);
+  if (!m) return;
+  g.lastRx = now();
+  if (m.t === 'i' && Array.isArray(m.h) && Array.isArray(m.e)) {
+    const R = g.remote;
+    [R.l, R.r, R.u, R.d] = m.h;
+    EDGES.forEach((k, i) => { if (m.e[i]) R[k] = 1; });
+  }
+}
 function hostGame() {
   netClose();
   const id = net.joinId, code = Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[rand(24) | 0]).join('');
-  const ready = () => { if (net.joinId === id && net.ui === 'wait') { net.code = code; net.ui = 'hosting'; } };
+  const ready = () => {
+    if (net.joinId !== id || net.ui !== 'wait') return;
+    net.code = code; net.ui = 'hosting'; net.role = 'host'; net.myId = 'h'; G.mode = 'online';
+  };
   net.ui = 'wait'; net.msg = 'Creating room…'; net.code = '';
-  loadPeer(() => {                                            // direct link
+  loadPeer(() => {                                            // direct links
     if (net.joinId !== id) return;
     const p = net.peer = new window.Peer(ROOM + code);
     p.on('open', ready);
-    p.on('connection', c => c.on('open', () => { if (net.joinId !== id || net.conn) return c.close(); setupConn(c, 'host'); }));
+    p.on('connection', c => c.on('open', () => {
+      if (net.joinId !== id) return shut(c);
+      const g = addGuest((c.metadata && c.metadata.id) || uid(), 'direct', c, null);
+      if (!g) { try { c.send(JSON.stringify({ t: 'full' })); } catch (e) { /* closing */ } setTimeout(() => shut(c), 600); return; }
+      c.on('data', d => { if (g.conn === c) guestMsg(g, d); });
+      c.on('close', () => { if (g.conn === c) removeGuest(g); });
+    }));
     p.on('error', e => { if (net.peer === p && e.type === 'unavailable-id') netFail('Room code clash. Please try again.'); });
   });
-  loadMqtt(() => BROKERS.forEach(url => {                     // relay fallback
+  loadMqtt(() => BROKERS.forEach(url => {                     // relay links
     if (net.joinId !== id) return;
     const c = window.mqtt.connect(url, { clientId: `sb-h-${code}-${uid()}`, clean: true, connectTimeout: 8000, reconnectPeriod: 3000 });
     net.relays.push(c);
@@ -554,29 +640,57 @@ function hostGame() {
     c.on('connect', () => c.subscribe(topic(code, 'up'), err => { if (!err) ready(); }));
     c.on('message', (t, raw) => {
       const m = parse(raw);
-      if (!m || net.joinId !== id) return;
-      if (net.conn && net.conn.client === c) {
-        net.lastRx = now();
-        if (m.t === 'hello') net.conn.send({ t: 'welcome' }); else onData(m);
+      if (!m || !m.id || net.joinId !== id) return;
+      if (m.t === 'hello') {
+        const g = addGuest(m.id, 'relay', null, c);
+        c.publish(topic(code, 'down'), JSON.stringify({ t: g ? 'welcome' : 'full', id: m.id }), { qos: 0 });
         return;
       }
-      if (m.t !== 'hello') return;
-      // a guest asks for the relay: accept if nobody is connected, or replace a direct link that only just opened
-      const young = net.conn && !net.conn.relay && now() - net.connT < 8000;
-      if (net.conn ? !young : net.ui !== 'hosting') return;
-      const old = net.conn; net.conn = null;
-      if (old) { try { old.close(); } catch (e) { /* already closed */ } }
-      const conn = relayConn(c, topic(code, 'down'));
-      setupConn(conn, 'host'); conn.send({ t: 'welcome' });
+      const g = net.guests.find(x => x.id === m.id);
+      if (g && g.client === c) guestMsg(g, m);
     });
   }));
   setTimeout(() => { if (net.joinId === id && net.ui === 'wait') netFail('Could not create a room. Check your internet connection.'); }, 20000);
 }
+// What every other player needs to draw the current frame. Kept small: poses and
+// particles are worked out on each screen instead of being sent.
+function snapshot(ev) {
+  const F = fight;
+  return { t: 's', pk: pkIdx(), ids: F.pid, ev,
+    F: { round: F.round, phase: F.phase, timer: F.timer, tick: F.tick, stage: F.stage, banner: F.banner, menu: F.menu, shake: F.shake, wins: F.wins, hitstop: F.hitstop },
+    f: F.f.map(f => ({ x: f.x, y: f.y, vx: f.vx, vy: f.vy, facing: f.facing, state: f.state, stateT: f.stateT, mv: f.move ? f.move.name : 0,
+      hp: f.hp, energy: f.energy, alpha: f.alpha, flash: f.flash, combo: f.combo, crouchB: +f.crouchB, threat: +f.threat, walkT: f.walkT })),
+    proj: F.proj.map(p => ({ kind: p.kind, x: p.x, y: p.y, vx: p.vx, color: p.color, life: p.life, t: p.t })) };
+}
+function hostSend() {
+  net.tick++;
+  const dG = net.guests.filter(g => g.kind === 'direct' && g.conn), rG = net.guests.filter(g => g.kind === 'relay' && g.client);
+  const pack = ev => JSON.stringify(G.scene === 'fight' && fight ? snapshot(ev)
+    : { t: 'g', scene: G.scene, T: G.t, cd: G.cd, sel: G.sel, ids: lobbyIds(), pk: pkIdx(), code: net.code, ev }, round2);
+  if (dG.length && net.tick % 2 === 0) {                      // direct: 30 updates a second
+    const s = pack(net.evD); net.evD = [];
+    for (const g of dG) { try { g.conn.send(s); } catch (e) { /* closing */ } }
+  }
+  if (rG.length && net.tick % 3 === 0) {                      // relay: 20 updates a second, one message for everybody
+    const s = pack(net.evR); net.evR = [];
+    for (const c of new Set(rG.map(g => g.client))) c.publish(topic(net.code, 'down'), s, { qos: 0 });
+  }
+  if (!dG.length) net.evD = [];
+  if (!rG.length) net.evR = [];
+  for (const g of net.guests) for (const k of EDGES) g.remote[k] = 0;
+}
+
+/* ---- guest side ---- */
 function joinGame(code) {
   netClose();
-  const id = net.joinId; let relayStarted = false;
+  const id = net.joinId, gid = uid(); let relayStarted = false;
   const live = () => net.joinId === id && !net.conn;
-  net.ui = 'wait'; net.msg = `Connecting to room ${code}…`;
+  net.myId = gid; net.code = code; net.ui = 'wait'; net.msg = `Connecting to room ${code}…`;
+  const connected = c => {
+    net.conn = c; net.role = 'guest'; net.lastSent = ''; net.tick = 0; net.lastRx = now(); net.via = c.relay ? 'relay' : 'direct';
+    net.ids = ['h', gid]; G.mode = 'online'; G.scene = 'select'; G.sel = { c: [0, 3], lock: [false, false] }; G.t = 0; G.cd = 0; fight = null;
+    sfxRaw.ok();
+  };
   const tryBroker = i => {
     if (!live() || i >= BROKERS.length) return;
     const c = window.mqtt.connect(BROKERS[i], { clientId: `sb-g-${code}-${uid()}`, clean: true, connectTimeout: 6000, reconnectPeriod: 0 });
@@ -585,16 +699,18 @@ function joinGame(code) {
     const giveUp = setTimeout(next, 9000);                    // no answer through this relay: try the next one
     c.on('error', next);
     c.on('connect', () => c.subscribe(topic(code, 'down'), () => {
+      const hello = JSON.stringify({ t: 'hello', id: gid });
       const iv = setInterval(() => {
         if (moved || !live()) { clearInterval(iv); if (!net.conn || net.conn.client !== c) endClient(c); return; }
-        c.publish(topic(code, 'up'), '{"t":"hello"}');
+        c.publish(topic(code, 'up'), hello);
       }, 700);
     }));
     c.on('message', (t, raw) => {
       const m = parse(raw);
-      if (!m || net.joinId !== id) return;
-      if (net.conn && net.conn.client === c) { net.lastRx = now(); onData(m); }
-      else if (live() && !moved && m.t === 'welcome') { clearTimeout(giveUp); setupConn(relayConn(c, topic(code, 'up')), 'guest'); }
+      if (!m || net.joinId !== id || (m.id && m.id !== gid)) return;      // messages addressed to another player
+      if (net.conn && net.conn.client === c) onData(m);
+      else if (live() && !moved && m.t === 'welcome') { clearTimeout(giveUp); connected(relayConn(c, topic(code, 'up'))); }
+      else if (live() && m.t === 'full') netFail('That room is full (6 players).');
     });
   };
   const startRelay = () => {
@@ -610,76 +726,87 @@ function joinGame(code) {
     const p = net.peer = new window.Peer();
     p.on('open', () => {
       if (net.peer !== p) return;
-      const c = p.connect(ROOM + code, { reliable: true, serialization: 'json' });
-      c.on('open', () => { if (live() && net.peer === p && !relayStarted) setupConn(c, 'guest'); else c.close(); });
+      const c = p.connect(ROOM + code, { reliable: true, serialization: 'json', metadata: { id: gid } });
+      c.on('open', () => {
+        if (!live() || net.peer !== p || relayStarted) return shut(c);
+        connected(c);
+        c.on('data', onData);
+        c.on('close', () => { if (net.conn === c) netFail('The connection to the host was closed.'); });
+      });
     });
     p.on('error', () => { if (net.peer === p) startRelay(); });
   }, startRelay);
   setTimeout(startRelay, 4000);                               // direct link not up after 4 s: use the relay
   setTimeout(() => {
-    if (live()) netFail(`Could not reach room ${code}. Check the code, and that your friend still has the "Waiting" screen open.`);
+    if (live()) netFail(`Could not reach room ${code}. Check the code, and that the host's game is still open.`);
   }, 30000);
 }
-function setupConn(c, role) {
-  net.conn = c; net.role = role; net.ev = []; net.remote = NOREMOTE(); net.lastSent = ''; net.tick = 0;
-  net.connT = net.lastRx = now(); net.via = c.relay ? 'relay' : 'direct';
-  G.mode = 'online'; sfxRaw.ok();
-  if (!c.relay) {
-    c.on('data', onData);
-    c.on('close', () => {
-      if (net.conn !== c) return;
-      // host: a direct link that dies straight away usually means the guest is switching to the relay
-      if (role === 'host' && net.relays.length && now() - net.connT < 8000) { net.conn = null; net.role = null; fight = null; G.scene = 'online'; net.ui = 'hosting'; }
-      else netFail('The connection to your friend was closed.');
-    });
+function playEvents(ev) {
+  for (const e of ev || []) {
+    const k = e[0];
+    if (k === 'say') sayRaw(e[1]);
+    else if (k === 'b') spawnBurst(e[1], e[2], e[3], e[4]);
+    else if (k === 'r') spawnRing(e[1], e[2], e[3]);
+    else if (sfxRaw[k]) sfxRaw[k](e[1]);
   }
-  gotoSelect();
 }
-function playEvents(ev) { for (const [k, a] of ev || []) { if (k === 'say') sayRaw(a); else if (sfxRaw[k]) sfxRaw[k](a); } }
 function onData(m) {
-  if (!m || typeof m !== 'object') return;
-  if (net.role === 'host') {
-    if (m.t !== 'i' || !Array.isArray(m.h) || !Array.isArray(m.e)) return;
-    const R = net.remote;
-    [R.l, R.r, R.u, R.d] = m.h;
-    EDGES.forEach((k, i) => { if (m.e[i]) R[k] = 1; });
-  } else if (net.role === 'guest') {
-    if (m.pk) G.picks = m.pk.map(i => ROSTER[i]);
-    if (m.t === 'g') { G.scene = m.scene; G.t = m.T; G.sel = m.sel; G.ladderI = 0; fight = null; }
-    else if (m.t === 's') {
-      const key = m.pk.join();
-      if (!fight || fight.pk !== key) { startFight(G.picks[0], G.picks[1]); fight.pk = key; }
-      const F = fight; Object.assign(F, m.F);
-      F.f = m.f.map((o, i) => { o.def = F.defs[i]; o.move = o.mv ? (MOVES[o.mv] || SPECIALS[o.mv]) : null; o.inp = EMPTY; return o; });
-      F.proj = m.proj.map(p => { p.owner = F.f[p.o]; return p; });
-      F.sparks = m.sparks; G.scene = 'fight';
-    }
-    playEvents(m.ev);
+  if (typeof m === 'string') m = parse(m);
+  if (!m || net.role !== 'guest') return;
+  net.lastRx = now();
+  if (m.t === 'full') return netFail('That room is full (6 players).');
+  if (m.pk) G.picks = m.pk.map(i => ROSTER[i]);
+  if (m.t === 'g') { G.scene = m.scene; G.t = m.T; G.cd = m.cd; G.sel = m.sel; net.ids = m.ids; fight = null; }
+  else if (m.t === 's' && m.pk) {
+    const key = m.pk.join() + '|' + m.ids.join();
+    if (!fight || fight.key !== key) { startFight(G.picks, m.ids); fight.key = key; }
+    const F = fight;
+    if (F.round !== m.F.round) { F.f = F.defs.map((d, i) => mkFighter(d, i, F.n)); F.sparks = []; }
+    Object.assign(F, m.F);
+    m.f.forEach((o, i) => {
+      const f = F.f[i];
+      if (!f) return;
+      const nx = o.x, ny = o.y, mv = o.mv;
+      delete o.x; delete o.y; delete o.mv;
+      Object.assign(f, o);
+      f.move = mv ? (MOVES[mv] || SPECIALS[mv]) : null;
+      f.nx = nx; f.ny = ny;
+      if (f.fresh || Math.abs(nx - f.x) > 110) { f.x = nx; f.y = ny; }   // first sight, or a teleport: jump straight there
+      f.fresh = false;
+    });
+    F.proj = m.proj; G.scene = 'fight';
   }
-}
-function snapshot() {
-  const F = fight;
-  return { t: 's', pk: G.picks.map(d => ROSTER.indexOf(d)), ev: net.ev,
-    F: { round: F.round, phase: F.phase, phaseT: F.phaseT, timer: F.timer, tick: F.tick, stage: F.stage, banner: F.banner, menu: F.menu, shake: F.shake, wins: F.wins },
-    f: F.f.map(f => { const o = {}; for (const k in f) if (k !== 'def' && k !== 'move' && k !== 'inp' && k !== 'buf') o[k] = f[k]; o.mv = f.move ? f.move.name : null; return o; }),
-    proj: F.proj.map(p => ({ kind: p.kind, x: p.x, y: p.y, vx: p.vx, color: p.color, life: p.life, t: p.t, o: p.owner.side })),
-    sparks: net.conn && net.conn.relay ? F.sparks.slice(-18) : F.sparks };
-}
-function hostSend() {
-  if (net.conn.relay && ++net.tick % 2) { for (const k of EDGES) net.remote[k] = 0; return; }   // relay: 30 updates a second
-  const pk = G.picks[0] && G.picks[1] ? G.picks.map(d => ROSTER.indexOf(d)) : null;
-  try {
-    net.conn.send(G.scene === 'fight' && fight ? snapshot() : { t: 'g', scene: G.scene, T: G.t, sel: G.sel, pk, ev: net.ev });
-  } catch (e) { /* connection closing */ }
-  net.ev = [];
-  for (const k of EDGES) net.remote[k] = 0;
+  playEvents(m.ev);
 }
 function guestUpdate() {
   const both = [K1, K2], i = readInput(both), n = nav(both);
-  const m = { t: 'i', h: [+i.l, +i.r, +i.u, +i.d], e: [+i.lp, +i.rp, +i.lk, +i.rk, +i.s, +n.left, +n.right, +n.up, +n.down, +(n.ok || !!anyOk())] };
+  const m = { t: 'i', id: net.myId, h: [+i.l, +i.r, +i.u, +i.d], e: [+i.lp, +i.rp, +i.lk, +i.rk, +i.s, +n.left, +n.right, +n.up, +n.down, +(n.ok || !!anyOk())] };
   const key = JSON.stringify(m);
-  if (key !== net.lastSent || m.e.some(Boolean) || ++net.tick % 45 === 0) { try { net.conn.send(m); } catch (e) { /* closing */ } net.lastSent = key; }
-  if (pressed.Escape && G.scene !== 'fight') { netClose(); gotoTitle(); }
+  if (key !== net.lastSent || m.e.some(Boolean) || ++net.tick % 45 === 0) { try { net.conn.send(key); } catch (e) { /* closing */ } net.lastSent = key; }
+  if (pressed.Escape && (G.scene !== 'fight' || (fight && fight.phase === 'matchend'))) { netClose(); gotoTitle(); }
+}
+// Between the host's updates each guest keeps its own picture moving: fighters glide
+// toward their latest known position and animate locally, so play looks smooth at 60 fps.
+function guestTick() {
+  const F = fight;
+  if (G.scene !== 'fight' || !F) return;
+  F.tick++;
+  if (F.shake > 0) F.shake *= .85;
+  updateSparks();
+  const frozen = F.hitstop > 0 || F.phase === 'matchend';
+  if (F.hitstop > 0) F.hitstop--;
+  for (const f of F.f) {
+    if (!frozen) {
+      f.nx = clamp(f.nx + f.vx, 40, W - 40);
+      if (f.ny < GROUND || f.vy < 0) { f.vy += .85; f.ny = Math.min(GROUND, f.ny + f.vy); }
+      f.stateT++;
+      if (f.state === 'walk') f.walkT += Math.sign(f.vx * f.facing);
+    }
+    f.x += (f.nx - f.x) * .45; f.y += (f.ny - f.y) * .6;
+    if (f.flash > 0) f.flash--;
+    mixPose(f.pose, targetPose(f), .4); f.lagHp = Math.max(f.hp, f.lagHp - .35);
+  }
+  if (!frozen) for (const p of F.proj) { p.x += p.vx; p.t++; }
 }
 function inviteLink() {
   if (!/^https?:$/.test(location.protocol) || /^(localhost|127\.|\[::1\])/.test(location.hostname)) return null;
@@ -703,19 +830,30 @@ function updateOnline() {
     if (n.ok || anyOk()) { net.ui = 'menu'; sfxRaw.ok(); }
   }
 }
+// Which fighter / cursor belongs to this screen's player (-1 when only watching).
+function mySide() {
+  if (G.mode !== 'online' || !net.role) return 0;
+  const ids = G.scene === 'fight' && fight ? fight.pid : net.role === 'host' ? lobbyIds() : net.ids;
+  return ids.indexOf(net.myId);
+}
 
-function startFight(d1, d2) {
-  if (d1 === d2) d2 = Object.assign({}, d2, { shirt: d2.accent, accent: d2.shirt });   // mirror match: alternate colours
+/* ------------------------------------------------------------- match flow */
+function startFight(defs, pids) {
+  const n = defs.length, seen = [];
+  const vd = defs.map(d => {                  // two players on the same fighter: the later ones get alternate colours
+    const k = seen.filter(x => x === d).length; seen.push(d);
+    return k === 0 ? d : Object.assign({}, d, k % 2 ? { shirt: d.accent, accent: d.shirt } : { shirt: d.pants, pants: d.shirt });
+  });
   const skill = clamp(G.diff * .3 + (G.mode === 'arcade' ? G.ladderI * .05 : .1), 0, 1);
-  fight = { defs: [d1, d2], f: [mkFighter(d1, 0), mkFighter(d2, 1)], wins: [0, 0], round: 1, phase: 'intro', phaseT: 0,
-    timer: 60, tick: 0, proj: [], sparks: [], stage: (rand(STAGES.length)) | 0, banner: null, paused: false, menu: 0,
+  fight = { defs: vd, pid: pids || ['p1', 'p2'], n, f: vd.map((d, i) => mkFighter(d, i, n)), wins: Array(n).fill(0), round: 1, phase: 'intro', phaseT: 0,
+    timer: n > 2 ? 90 : 60, tick: 0, proj: [], sparks: [], stage: (rand(STAGES.length)) | 0, banner: null, paused: false, menu: 0,
     hitstop: 0, shake: 0, winner: -1, ai: { t: 20, act: 'idle', seq: [], skill, airT: 0 } };
   G.scene = 'fight';
 }
 function newRound() {
   const F = fight;
-  F.f = [mkFighter(F.defs[0], 0), mkFighter(F.defs[1], 1)];
-  F.phase = 'intro'; F.phaseT = 0; F.timer = 60; F.proj = []; F.sparks = []; F.winner = -1; F.banner = null;
+  F.f = F.defs.map((d, i) => mkFighter(d, i, F.n));
+  F.phase = 'intro'; F.phaseT = 0; F.timer = F.n > 2 ? 90 : 60; F.proj = []; F.sparks = []; F.winner = -1; F.banner = null;
   F.ai.t = 20; F.ai.act = 'idle'; F.ai.seq = [];
 }
 function banner(s, sub, dur = 90) { fight.banner = { s, sub, t0: fight.tick, dur }; }
@@ -726,20 +864,33 @@ function endOpts() {
   return ['RETRY', 'MAIN MENU'];
 }
 function gotoTitle() { G.scene = 'title'; G.menu = 0; fight = null; }
-function gotoSelect() { G.scene = 'select'; G.sel.lock = [false, false]; G.t = 0; fight = null; }
-function gotoVs() { G.scene = 'vs'; G.t = 0; say(`${G.picks[0].name} versus ${G.picks[1].name}`); }
+function gotoSelect() {
+  fight = null; G.t = 0; G.cd = 0;
+  const old = G.sel.c;
+  if (G.mode === 'online') {
+    if (!net.guests.length) { G.scene = 'online'; net.ui = 'hosting'; return; }      // nobody else here yet
+    const n = 1 + net.guests.length;
+    G.sel = { c: Array.from({ length: n }, (_, i) => old[i] != null ? old[i] : (i * 3) % ROSTER.length), lock: Array(n).fill(false) };
+  } else G.sel = { c: [old[0] || 0, old[1] != null ? old[1] : 4], lock: [false, false] };
+  G.scene = 'select';
+}
+function gotoVs() {
+  G.scene = 'vs'; G.t = 0;
+  say(G.picks.length > 2 ? `${G.picks.length} player brawl` : `${G.picks[0].name} versus ${G.picks[1].name}`);
+}
 
 /* ----------------------------------------------------------- fight update */
 function updateFight() {
   const F = fight, both = [K1, K2], onl = G.mode === 'online';
   if (F.phase === 'matchend') {
-    const n = nav(both), opts = endOpts(), rn = onl ? rnav() : {};
-    if (n.up || rn.up) { F.menu = (F.menu + opts.length - 1) % opts.length; sfx.move(); }
-    if (n.down || rn.down) { F.menu = (F.menu + 1) % opts.length; sfx.move(); }
-    if (n.ok || anyOk() || rn.ok) {
+    const n = nav(both), opts = endOpts();
+    if (n.up) { F.menu = (F.menu + opts.length - 1) % opts.length; sfx.move(); }
+    if (n.down) { F.menu = (F.menu + 1) % opts.length; sfx.move(); }
+    if (n.ok || anyOk()) {
       sfx.ok();
       const o = opts[F.menu];
-      if (o === 'REMATCH' || o === 'RETRY') startFight(G.picks[0], G.picks[1]);
+      if (o === 'RETRY') startFight(G.picks, G.pids);
+      else if (o === 'REMATCH') { if (!onl || lobbyIds().join() === F.pid.join()) startFight(G.picks, F.pid); else gotoSelect(); }
       else if (o === 'CHARACTER SELECT') gotoSelect();
       else if (o === 'LEAVE GAME') { netClose(); gotoTitle(); }
       else if (o === 'MAIN MENU') gotoTitle();
@@ -763,38 +914,55 @@ function updateFight() {
   F.phaseT++;
   if (F.phase === 'ko' && F.phaseT < 80 && F.phaseT % 3) return;   // slow motion
 
-  const [a, b] = F.f, live = F.phase === 'fight';
-  a.inp = !live ? EMPTY : readInput(G.mode === 'versus' ? [K1] : both);
-  b.inp = !live ? EMPTY : onl ? Object.assign({}, net.remote) : G.mode === 'arcade' ? aiInput(b, a, F.ai) : readInput([K2]);
-  updateFighter(a, b); updateFighter(b, a);
-  if (Math.abs(a.y - b.y) < 70 && a.state !== 'down' && b.state !== 'down') {
-    for (let i = 0; i < 2; i++) {
-      const dx = b.x - a.x, ov = 50 - Math.abs(dx);
-      if (ov <= 0) break;
-      const s = dx >= 0 ? 1 : -1;
-      a.x = clamp(a.x - s * ov / 2, 40, W - 40); b.x = clamp(b.x + s * ov / 2, 40, W - 40);
+  const fs = F.f, live = F.phase === 'fight';
+  fs.forEach((f, i) => {                      // who controls each fighter this tick
+    f.tgt = nearest(f);
+    let inp = EMPTY;
+    if (live && f.hp > 0) {
+      if (G.mode === 'arcade') inp = i === 0 ? readInput(both) : aiInput(f, f.tgt, F.ai);
+      else if (G.mode === 'versus') inp = readInput([i ? K2 : K1]);
+      else if (F.pid[i] === net.myId) inp = readInput(both);
+      else { const g = net.guests.find(x => x.id === F.pid[i]); if (g) inp = Object.assign({}, g.remote); else f.gone = true; }
     }
+    f.inp = inp;
+  });
+  if (live) for (const f of fs) if (f.gone && f.hp > 0) {          // a player who left the room is knocked out
+    f.hp = 0; f.state = 'down'; f.stateT = 0; f.downT = 0; f.move = null; f.vy = -6; f.y = Math.min(f.y, GROUND - 1);
+  }
+  for (const f of fs) updateFighter(f, f.tgt);
+  for (let k = 0; k < 2; k++) for (let i = 0; i < fs.length; i++) for (let j = i + 1; j < fs.length; j++) {   // keep fighters from overlapping
+    const a = fs[i], b = fs[j];
+    if (Math.abs(a.y - b.y) >= 70 || a.state === 'down' || b.state === 'down') continue;
+    const dx = b.x - a.x, ov = 50 - Math.abs(dx);
+    if (ov <= 0) continue;
+    const s = dx >= 0 ? 1 : -1;
+    a.x = clamp(a.x - s * ov / 2, 40, W - 40); b.x = clamp(b.x + s * ov / 2, 40, W - 40);
   }
   updateProj(); updateSparks();
-  for (const f of F.f) { mixPose(f.pose, targetPose(f), .4); f.lagHp = Math.max(f.hp, f.lagHp - .35); }
+  for (const f of fs) { mixPose(f.pose, targetPose(f), .4); f.lagHp = Math.max(f.hp, f.lagHp - .35); }
 
   if (F.phase === 'intro') {
     if (F.phaseT === 1) { banner(`ROUND ${F.round}`, null, 65); say(`Round ${F.round}`); }
-    if (F.phaseT === 70) { banner('FIGHT!', null, 45); say('Fight!'); tone(440, .3, 'sawtooth', .08, 400); }
+    if (F.phaseT === 70) { banner(F.n > 2 ? 'BRAWL!' : 'FIGHT!', null, 45); say(F.n > 2 ? 'Brawl!' : 'Fight!'); tone(440, .3, 'sawtooth', .08, 400); }
     if (F.phaseT >= 80) { F.phase = 'fight'; F.phaseT = 0; }
   } else if (F.phase === 'fight') {
     if (F.phaseT % 60 === 0 && F.timer > 0) F.timer--;
-    const dead = F.f.filter(f => f.hp <= 0);
-    if (dead.length) {
-      F.winner = dead.length === 2 ? -1 : 1 - dead[0].side;
-      F.phase = 'ko'; F.phaseT = 0; banner(dead.length === 2 ? 'DOUBLE K.O.' : 'K.O.', null, 110); sfx.ko(); say('K O');
-    } else if (F.timer <= 0) {
-      const ra = a.hp / a.maxHp, rb = b.hp / b.maxHp;
-      F.winner = ra === rb ? -1 : ra > rb ? 0 : 1;
+    const alive = fs.filter(f => f.hp > 0);
+    if (F.n > 2) for (const f of fs) if (f.hp <= 0 && !f.out) {    // brawl: call out each knockout, the round goes on
+      f.out = true;
+      if (alive.length > 1) { banner(`${f.def.name} IS OUT!`, null, 55); sfx.ko(); }
+    }
+    if (alive.length <= 1) {                  // last one standing takes the round
+      F.winner = alive.length ? alive[0].side : -1;
+      F.phase = 'ko'; F.phaseT = 0; banner(alive.length ? 'K.O.' : 'DOUBLE K.O.', null, 110); sfx.ko(); say('K O');
+    } else if (F.timer <= 0) {                // time up: most health left wins
+      let best = -1, br = -1, tie = false;
+      for (const f of alive) { const r = f.hp / f.maxHp; if (r > br) { br = r; best = f.side; tie = false; } else if (r === br) tie = true; }
+      F.winner = tie ? -1 : best;
       F.phase = 'ko'; F.phaseT = 80; banner('TIME UP', null, 60); say('Time up');
     }
   } else if (F.phase === 'ko') {
-    const w = F.f[F.winner];
+    const w = fs[F.winner];
     if (F.phaseT >= 130 && w && w.state !== 'win' && controllable(w)) {
       w.state = 'win'; w.stateT = 0;
       banner(`${w.def.name} WINS`, w.hp >= w.maxHp ? 'PERFECT!' : null, 130);
@@ -804,7 +972,7 @@ function updateFight() {
     if (F.phaseT >= 290) {
       F.drawn = false;
       if (F.winner >= 0) F.wins[F.winner]++;
-      if (F.wins[0] >= 2 || F.wins[1] >= 2) { F.phase = 'matchend'; F.menu = 0; F.banner = null; }
+      if (F.wins.some(v => v >= 2)) { F.phase = 'matchend'; F.menu = 0; F.banner = null; }
       else { F.round++; newRound(); }
     }
   }
@@ -826,17 +994,20 @@ function updateTitle() {
   }
 }
 function updateSelect() {
-  const S = G.sel, n = ROSTER.length, cols = 5, onl = G.mode === 'online';
+  const S = G.sel, n = ROSTER.length, cols = 5, onl = G.mode === 'online', arc = G.mode === 'arcade', both = [K1, K2];
   G.t++;
   if (pressed.Escape) {
     sfx.back();
     if (onl) { netClose(); gotoTitle(); }
-    else if (S.lock[0] || S.lock[1]) S.lock = [false, false]; else gotoTitle();
+    else if (S.lock.some(Boolean)) S.lock = S.lock.map(() => false); else gotoTitle();
     return;
   }
-  const both = [K1, K2];
-  const players = G.mode === 'arcade' ? [nav(both)] : onl ? [nav(both), rnav()] : [nav([K1]), nav([K2])];
-  players.forEach((v, i) => {
+  const mine = nav(both), hostOk = mine.ok || anyOk();
+  // one set of menu buttons per player: this screen's own, plus each online friend's
+  const navs = arc ? [mine]
+    : onl ? [mine, ...net.guests.map(g => ({ up: g.remote.nu, down: g.remote.nd, left: g.remote.nl, right: g.remote.nr, ok: g.remote.ok }))]
+    : [nav([K1]), nav([K2])];
+  navs.forEach((v, i) => {
     if (S.lock[i]) return;
     let c = S.c[i];
     if (v.left) c = c % cols === 0 ? c + cols - 1 : c - 1;
@@ -844,34 +1015,39 @@ function updateSelect() {
     if (v.up || v.down) c = (c + cols) % n;
     c = clamp(c, 0, n - 1);
     if (c !== S.c[i]) { S.c[i] = c; sfx.move(); }
-    const ok = v.ok || (G.mode === 'arcade' ? anyOk() : onl ? (i === 0 && anyOk()) : i === 0 ? pressed.Space : (pressed.Enter || pressed.NumpadEnter));
+    const ok = v.ok || (arc || (onl && i === 0) ? anyOk() : onl ? false : i === 0 ? pressed.Space : (pressed.Enter || pressed.NumpadEnter));
     if (ok) { S.lock[i] = true; sfx.ok(); say(ROSTER[c].name); }
   });
-  if (G.mode === 'arcade' && S.lock[0]) {
-    G.picks[0] = ROSTER[S.c[0]];
-    G.ladder = ROSTER.filter(d => d !== G.picks[0]).sort(() => Math.random() - .5);
-    G.ladderI = 0; G.picks[1] = G.ladder[0]; gotoVs();
-  } else if (G.mode !== 'arcade' && S.lock[0] && S.lock[1]) {
-    G.picks = [ROSTER[S.c[0]], ROSTER[S.c[1]]]; gotoVs();
-  }
+  const start = () => { G.picks = S.c.map(c => ROSTER[c]); G.pids = onl ? lobbyIds() : ['p1', 'p2']; G.cd = 0; gotoVs(); };
+  if (arc) {
+    if (S.lock[0]) {
+      const me = ROSTER[S.c[0]];
+      G.ladder = ROSTER.filter(d => d !== me).sort(() => Math.random() - .5);
+      G.ladderI = 0; G.picks = [me, G.ladder[0]]; G.pids = ['p1', 'cpu']; gotoVs();
+    }
+  } else if (S.lock.length >= 2 && S.lock.every(Boolean)) {
+    if (!onl) start();
+    else if (++G.cd > 300 || (G.cd > 25 && hostOk)) start();   // online: 5 second countdown so late friends can still join
+  } else G.cd = 0;
 }
 function update() {
-  const typing = G.scene === 'online' && net.ui === 'typing';
+  const typing = G.scene === 'online' && net.ui === 'typing', both = [K1, K2];
   if (pressed.KeyM && !typing) { muted = !muted; if (muted && window.speechSynthesis) speechSynthesis.cancel(); }
-  if (net.conn && net.conn.relay && now() - net.lastRx > 15000) netFail('The connection to your friend was lost.');
-  if (net.relays.length && net.conn && !net.conn.relay && now() - net.connT > 8000) { net.relays.forEach(endClient); net.relays = []; }
-  if (net.role === 'guest' && net.conn) guestUpdate();
-  else {
+  if (net.role === 'guest' && net.conn) {
+    if (now() - net.lastRx > 15000) netFail('The connection to the host was lost.');
+    else { guestUpdate(); guestTick(); }
+  } else {
+    if (net.role === 'host') for (const g of [...net.guests]) if (now() - g.lastRx > 15000) removeGuest(g);   // a friend dropped out
     switch (G.scene) {
       case 'title': G.t++; updateTitle(); break;
-      case 'howto': if (anyOk() || pressed.Escape || nav([K1, K2]).ok) { sfx.back(); G.scene = 'title'; } break;
+      case 'howto': if (anyOk() || pressed.Escape || nav(both).ok) { sfx.back(); G.scene = 'title'; } break;
       case 'online': updateOnline(); break;
       case 'select': updateSelect(); break;
-      case 'vs': if (++G.t > 150 || (G.t > 20 && (anyOk() || nav([K1, K2]).ok || net.remote.ok))) startFight(G.picks[0], G.picks[1]); break;
+      case 'vs': if (++G.t > 150 || (G.t > 20 && (anyOk() || nav(both).ok))) startFight(G.picks, G.pids); break;
       case 'fight': updateFight(); break;
-      case 'champion': if (++G.t > 60 && (anyOk() || nav([K1, K2]).ok)) gotoTitle(); break;
+      case 'champion': if (++G.t > 60 && (anyOk() || nav(both).ok)) gotoTitle(); break;
     }
-    if (net.role === 'host' && net.conn) hostSend();
+    if (net.role === 'host' && net.guests.length) hostSend();
   }
   for (const k in pressed) delete pressed[k];
 }
@@ -1194,8 +1370,21 @@ function mkStage(i) {
 const STAGES = [0, 1, 2].map(mkStage);
 
 /* ------------------------------------------------------------------- HUD */
-function drawHud() {
+function drawBanner() {
   const F = fight;
+  if (!F.banner) return;
+  const age = F.tick - F.banner.t0;
+  if (age > F.banner.dur || age < 0) { F.banner = null; return; }
+  const sc = 1 + Math.max(0, 8 - age) * .2;
+  ctx.save(); ctx.translate(W / 2, 220); ctx.scale(sc, sc);
+  ctx.globalAlpha = Math.min(1, (F.banner.dur - age) / 10);
+  text(F.banner.s, 0, 0, F.banner.s.length > 12 ? 64 : 90, '#ffd23f');
+  if (F.banner.sub) text(F.banner.sub, 0, 70, 44, '#fff');
+  ctx.restore();
+}
+// Two fighters: the classic pair of long health bars.
+function drawHudDuel() {
+  const F = fight, me = mySide();
   F.f.forEach((f, i) => {
     const bw = 360, x0 = i ? W - 40 - bw : 40, y = 28, r = clamp(f.hp / f.maxHp, 0, 1), lr = clamp(f.lagHp / f.maxHp, 0, 1);
     ctx.fillStyle = '#111'; ctx.fillRect(x0 - 4, y - 4, bw + 8, 30);
@@ -1203,12 +1392,11 @@ function drawHud() {
     const fill = (rr, col) => { ctx.fillStyle = col; ctx.fillRect(i ? x0 : x0 + bw * (1 - rr), y, bw * rr, 22); };
     fill(lr, '#fff'); fill(r, r > .3 ? '#ffd23f' : '#ff5a36');
     ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(x0, y, bw, 7);
-    text(f.def.name + (G.mode === 'online' && i === mySide() ? '  (YOU)' : ''), i ? W - 40 : 40, 70, 22, '#fff', i ? 'right' : 'left');
+    text(f.def.name + (G.mode === 'online' && i === me ? '  (YOU)' : ''), i ? W - 40 : 40, 70, 22, '#fff', i ? 'right' : 'left');
     for (let k = 0; k < 2; k++) {
       const px = i ? W / 2 + 52 + k * 22 : W / 2 - 52 - k * 22;
       ctx.beginPath(); ctx.arc(px, 70, 7, 0, 7); ctx.fillStyle = k < F.wins[i] ? '#ffd23f' : '#333'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = '#000'; ctx.stroke();
     }
-    // energy
     const ew = 150, ex = i ? W - 40 - ew : 40, ey = 88, er = f.energy / 100;
     ctx.fillStyle = '#111'; ctx.fillRect(ex - 3, ey - 3, ew + 6, 16);
     ctx.fillStyle = f.energy >= 50 ? f.def.accent : '#666'; ctx.fillRect(i ? ex + ew * (1 - er) : ex, ey, ew * er, 10);
@@ -1217,18 +1405,31 @@ function drawHud() {
     if (f.combo > 1) text(`${f.combo} HIT COMBO!`, i ? W - 60 : 60, 140, 30, '#ffd23f', i ? 'right' : 'left');
   });
   text(String(F.timer).padStart(2, '0'), W / 2, 40, 44, F.timer <= 10 ? '#ff5a36' : '#fff');
-  if (F.banner) {
-    const age = F.tick - F.banner.t0;
-    if (age > F.banner.dur) F.banner = null;
-    else {
-      const sc = 1 + Math.max(0, 8 - age) * .2;
-      ctx.save(); ctx.translate(W / 2, 220); ctx.scale(sc, sc);
-      ctx.globalAlpha = Math.min(1, (F.banner.dur - age) / 10);
-      text(F.banner.s, 0, 0, F.banner.s.length > 12 ? 64 : 90, '#ffd23f');
-      if (F.banner.sub) text(F.banner.sub, 0, 70, 44, '#fff');
-      ctx.restore();
+}
+// Three to six fighters: one compact card each across the top.
+function drawHudBrawl() {
+  const F = fight, n = F.n, pw = (W - 16) / n, me = mySide();
+  F.f.forEach((f, i) => {
+    const x = 8 + i * pw, dead = f.hp <= 0, bw = pw - 54, r = clamp(f.hp / f.maxHp, 0, 1), lr = clamp(f.lagHp / f.maxHp, 0, 1);
+    ctx.globalAlpha = dead ? .45 : 1;
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(x + 2, 6, pw - 4, 50);
+    ctx.strokeStyle = i === me ? '#ffd23f' : PCOL[i]; ctx.lineWidth = i === me ? 3 : 1.5; ctx.strokeRect(x + 2, 6, pw - 4, 50);
+    face(f.def, x + 24, 31, 17);
+    text(i === me ? 'YOU' : f.def.name, x + 46, 18, 14, i === me ? '#ffd23f' : PCOL[i], 'left');
+    for (let k = 0; k < 2; k++) {
+      ctx.beginPath(); ctx.arc(x + pw - 12 - k * 11, 18, 4, 0, 7); ctx.fillStyle = k < F.wins[i] ? '#ffd23f' : '#333'; ctx.fill(); ctx.lineWidth = 1.5; ctx.strokeStyle = '#000'; ctx.stroke();
     }
-  }
+    ctx.fillStyle = '#5a0d0d'; ctx.fillRect(x + 46, 29, bw, 10);
+    ctx.fillStyle = '#fff'; ctx.fillRect(x + 46, 29, bw * lr, 10);
+    ctx.fillStyle = r > .3 ? '#ffd23f' : '#ff5a36'; ctx.fillRect(x + 46, 29, bw * r, 10);
+    ctx.fillStyle = '#222'; ctx.fillRect(x + 46, 43, bw, 5);
+    ctx.fillStyle = f.energy >= 50 ? f.def.accent : '#777'; ctx.fillRect(x + 46, 43, bw * f.energy / 100, 5);
+    if (dead) text('OUT', x + pw / 2 + 20, 31, 20, '#ff5a36');
+  });
+  ctx.globalAlpha = 1;
+  text(String(F.timer).padStart(2, '0'), W / 2, 84, 34, F.timer <= 10 ? '#ff5a36' : '#fff');
+  const mf = F.f[me];
+  if (mf && mf.combo > 1) text(`${mf.combo} HIT COMBO!`, W / 2, 124, 26, '#ffd23f');
 }
 function drawMenuBox(title, opts, sel, sub) {
   ctx.fillStyle = 'rgba(0,0,0,.65)'; ctx.fillRect(0, 0, W, H);
@@ -1237,12 +1438,21 @@ function drawMenuBox(title, opts, sel, sub) {
   opts.forEach((o, i) => text((i === sel ? '▶ ' : '') + o, W / 2, 280 + i * 50, 34, i === sel ? '#fff' : '#888'));
 }
 function renderFight() {
-  const F = fight;
+  const F = fight, brawl = F.n > 2, me = mySide();
   ctx.save();
   if (F.shake > .5) ctx.translate(rand(-F.shake, F.shake), rand(-F.shake, F.shake));
   ctx.drawImage(STAGES[F.stage], 0, 0);
-  const order = F.f[0].state === 'attack' ? [1, 0] : [0, 1];
-  order.forEach(i => drawFighter(F.f[i]));
+  // knocked-out fighters at the back, whoever is attacking in front
+  const rank = f => f.hp <= 0 ? 0 : f.state === 'attack' ? 2 : 1;
+  for (const f of [...F.f].sort((a, b) => rank(a) - rank(b))) {
+    const al = f.alpha;
+    if (brawl && f.hp <= 0 && f.y >= GROUND) f.alpha = .4;
+    drawFighter(f); f.alpha = al;
+  }
+  if (brawl) F.f.forEach((f, i) => {            // name tag over each fighter so you can find yourself in the crowd
+    if (f.hp <= 0) return;
+    text(i === me ? '▼ YOU' : f.def.name, f.x, f.y - 204, i === me ? 15 : 12, i === me ? '#ffd23f' : PCOL[i]);
+  });
   F.proj.forEach(drawProj);
   for (const s of F.sparks) {
     ctx.globalAlpha = clamp(s.life / s.max, 0, 1);
@@ -1251,25 +1461,26 @@ function renderFight() {
   }
   ctx.globalAlpha = 1;
   ctx.restore();
-  drawHud();
+  if (brawl) drawHudBrawl(); else drawHudDuel();
+  drawBanner();
   if (F.paused) drawMenuBox('PAUSED', ['RESUME', 'QUIT TO MENU'], F.menu);
   if (F.phase === 'matchend') {
-    const w = F.wins[0] >= 2 ? 0 : 1;
-    drawMenuBox(`${F.defs[w].name} WINS!`, endOpts(), F.menu,
+    const w = Math.max(0, F.wins.findIndex(v => v >= 2)), guest = net.role === 'guest';
+    drawMenuBox(`${F.defs[w].name} WINS!`, guest ? ['WAITING FOR THE HOST…'] : endOpts(), guest ? -1 : F.menu,
       G.mode === 'arcade' ? (w === 0 ? `Opponent ${G.ladderI + 1} of ${G.ladder.length} defeated` : 'You were defeated')
-        : G.mode === 'online' ? (w === mySide() ? 'You win the match!' : 'Your friend wins the match')
+        : G.mode === 'online' ? (w === me ? 'You win the match!' : me < 0 ? 'Match over' : 'Better luck next match')
         : `Player ${w + 1} takes the match`);
   }
 }
 
-const mySide = () => net.role === 'guest' ? 1 : 0;
 function renderOnline() {
   bg();
   text('ONLINE MATCH', W / 2, 70, 64, '#ffd23f');
   const small = (s, y, c = '#cbb') => text(s, W / 2, y, 18, c, 'center', null);
   if (net.ui === 'menu') {
     ['HOST A GAME', 'JOIN A GAME'].forEach((o, i) => text((i === net.menu ? '▶ ' : '') + o, W / 2, 220 + i * 56, 38, i === net.menu ? '#fff' : '#9a8fa8'));
-    small('One player hosts and shares the room code. The other joins with it.', 380);
+    small('One player hosts and shares the room code. Up to 5 friends join with it.', 370);
+    small('2 players is a one-on-one fight. 3 to 6 players is a free-for-all brawl.', 398);
     small(touch ? 'LP to choose  ·  ☰ to go back' : 'ENTER to choose  ·  ESC to go back', 500);
   } else if (net.ui === 'wait') {
     text(net.msg + ' '.repeat((performance.now() / 400 | 0) % 3), W / 2, 260, 30, '#fff');
@@ -1278,10 +1489,10 @@ function renderOnline() {
     small('Your room code', 150, '#fff');
     text(net.code.split('').join(' '), W / 2, 230, 110, '#fff');
     const link = inviteLink();
-    if (link) { small('Send your friend this link — it joins your room automatically:', 320, '#fff'); text(link, W / 2, 350, 20, '#5ee7ff'); }
-    else small('Your friend opens the game, chooses ONLINE → JOIN A GAME and types this code.', 330, '#fff');
+    if (link) { small('Send your friends this link — it joins your room automatically:', 320, '#fff'); text(link, W / 2, 350, 20, '#5ee7ff'); }
+    else small('Friends open the game, choose ONLINE → JOIN A GAME and type this code.', 330, '#fff');
     small(net.copied ? 'Copied!' : touch ? `Tap the screen to share the ${link ? 'link' : 'code'}` : `Press C to copy the ${link ? 'link' : 'code'}`, 395, net.copied ? '#c6ff00' : '#cbb');
-    text('Waiting for your friend' + '.'.repeat((performance.now() / 400 | 0) % 4), W / 2, 450, 26, '#ffd23f');
+    text('Waiting for friends (up to 6 players)' + '.'.repeat((performance.now() / 400 | 0) % 4), W / 2, 450, 26, '#ffd23f');
     small('Keep this tab open and visible while you play  ·  ESC to cancel', 505);
   } else if (net.ui === 'typing') {
     small(touch ? 'Tap the box, type the 4-letter room code, then JOIN' : 'Type the 4-letter room code your friend gave you', 110, '#fff');
@@ -1294,8 +1505,8 @@ function renderOnline() {
     if (!touch) small(net.code.length === 4 ? 'Press ENTER to join' : 'BACKSPACE to correct', 360, net.code.length === 4 ? '#ffd23f' : '#cbb');
     small(touch ? '☰ to go back' : 'ESC to go back', 500);
   } else {
-    text(net.msg, W / 2, 250, 28, '#ff8a80');
-    small('Press ENTER', 330, '#ffd23f');
+    text(net.msg, W / 2, 250, 26, '#ff8a80');
+    small(touch ? 'Press LP' : 'Press ENTER', 330, '#ffd23f');
   }
 }
 
@@ -1342,15 +1553,15 @@ function renderHowto() {
 function statBars(d, x, y, align) {
   [['SPD', d.speed], ['POW', d.power], ['HP', d.health]].forEach(([l, v], i) => {
     const yy = y + i * 18, bx = align === 'left' ? x + 40 : x - 40 - 100;
-    text(l, align === 'left' ? x : x, yy, 14, '#cbb', align, null);
+    text(l, x, yy, 14, '#cbb', align, null);
     for (let k = 0; k < 5; k++) { ctx.fillStyle = k < v ? d.accent : '#333'; ctx.fillRect(bx + k * 20, yy - 5, 17, 10); }
   });
 }
-function previewPanel(d, side, label, locked) {
+function previewPanel(d, side, label, locked, col) {
   const x = side ? W - 140 : 140, al = side ? 'right' : 'left', tx = side ? W - 30 : 30;
   ctx.fillStyle = d ? shade(d.shirt, -.4) : '#222'; ctx.beginPath(); ctx.arc(x, 120, 88, 0, 7); ctx.fill();
   if (d) face(d, x, 120, 78, side); else text('?', x, 120, 110, '#666');
-  text(label, tx, 22, 18, side ? '#5ee7ff' : '#ff6b6b', al);
+  text(label, tx, 22, 18, col, al);
   if (!d) return;
   text(d.name, tx, 226, 34, locked ? '#ffd23f' : '#fff', al);
   text(d.title, tx, 254, 15, '#cbb', al, null);
@@ -1358,40 +1569,69 @@ function previewPanel(d, side, label, locked) {
 }
 function renderSelect() {
   bg();
-  const S = G.sel, arc = G.mode === 'arcade';
+  const S = G.sel, arc = G.mode === 'arcade', onl = G.mode === 'online';
+  const me = onl ? Math.max(0, mySide()) : 0, n = arc ? 1 : S.c.length;
   text('CHOOSE YOUR FIGHTER', W / 2, 40, 44, '#ffd23f');
-  const d1 = ROSTER[S.c[0]], d2 = arc ? null : ROSTER[S.c[1]];
-  const onl = G.mode === 'online', me = mySide();
-  previewPanel(d1, 0, arc ? 'YOU' : onl ? (me === 0 ? 'YOU' : 'FRIEND') : 'PLAYER 1', S.lock[0]);
-  previewPanel(d2, 1, arc ? 'CPU' : onl ? (me === 1 ? 'YOU' : 'FRIEND') : 'PLAYER 2', S.lock[1]);
-  statBars(d1, 300, 110, 'left'); if (d2) statBars(d2, W - 300, 110, 'right');
+  if (onl) text(`ROOM ${net.code}   ·   ${n} PLAYER${n > 1 ? 'S' : ''}   ·   ${n < MAXP ? 'friends can still join' : 'room is full'}`, W / 2, 78, 16, '#5ee7ff', 'center', null);
+  // left: this screen's player.  right: the opponent, or the list of everyone in a brawl
+  const dl = ROSTER[S.c[me]] || ROSTER[0];
+  previewPanel(dl, 0, arc || onl ? 'YOU' : 'PLAYER 1', S.lock[me], PCOL[me]);
+  statBars(dl, 300, 118, 'left');
+  if (arc) previewPanel(null, 1, 'CPU', false, PCOL[1]);
+  else if (n <= 2) {
+    const o = onl ? 1 - me : 1, d2 = S.c[o] != null ? ROSTER[S.c[o]] : null;
+    previewPanel(d2, 1, d2 ? (onl ? 'FRIEND' : 'PLAYER 2') : 'WAITING…', S.lock[o], PCOL[o]);
+    if (d2) statBars(d2, W - 300, 118, 'right');
+  } else S.c.forEach((c, p) => {
+    const y = 34 + p * 40, d = ROSTER[c];
+    face(d, W - 36, y, 16, true);
+    text(`${p === me ? 'YOU' : 'P' + (p + 1)}   ${d.name}${S.lock[p] ? '  ✓' : ''}`, W - 62, y, 18, S.lock[p] ? '#ffd23f' : PCOL[p], 'right');
+  });
   const cw = 104, x0 = W / 2 - cw * 2.5, y0 = 300;
   ROSTER.forEach((d, i) => {
     const x = x0 + (i % 5) * cw, y = y0 + (i / 5 | 0) * cw;
     ctx.fillStyle = shade(d.shirt, -.5); ctx.fillRect(x + 4, y + 4, cw - 8, cw - 8);
     face(d, x + cw / 2, y + cw / 2 - 6, 36);
     text(d.name, x + cw / 2, y + cw - 14, 14, '#fff');
-    [0, 1].forEach(p => {
-      if ((p === 1 && arc) || S.c[p] !== i) return;
-      const pulse = S.lock[p] ? 0 : Math.sin(G.t * .2) * 2;
-      ctx.strokeStyle = p ? '#5ee7ff' : '#ff6b6b'; ctx.lineWidth = 5;
-      ctx.strokeRect(x + 3 - pulse + p * 3, y + 3 - pulse + p * 3, cw - 6 + pulse * 2 - p * 6, cw - 6 + pulse * 2 - p * 6);
-      text(arc ? 'YOU' : `P${p + 1}`, x + (p ? cw - 18 : 18), y + 14, 15, p ? '#5ee7ff' : '#ff6b6b');
+    S.c.forEach((c, p) => {                    // one coloured cursor per player
+      if ((arc && p > 0) || c !== i) return;
+      const pulse = S.lock[p] ? 0 : Math.sin(G.t * .2) * 2, inset = p * 3;
+      ctx.strokeStyle = PCOL[p]; ctx.lineWidth = 4;
+      ctx.strokeRect(x + 3 + inset - pulse, y + 3 + inset - pulse, cw - 6 - inset * 2 + pulse * 2, cw - 6 - inset * 2 + pulse * 2);
+      text(arc || (onl && p === me) ? 'YOU' : `P${p + 1}`, x + 20 + (p % 3) * 32, y + 14 + (p > 2 ? 16 : 0), 14, PCOL[p]);
     });
   });
-  if (touch) text(onl ? `Pad: move   ·   LP: confirm   ·   You are the ${me ? 'BLUE' : 'RED'} cursor` : 'Pad: move   ·   LP: confirm   ·   ☰: back', W / 2, 524, 15, '#cbb', 'center', null);
-  else text(onl ? `Move: WASD / arrows   ·   Confirm: F or ENTER   ·   ESC: leave   ·   You are the ${me ? 'BLUE' : 'RED'} cursor`
+  if (onl && G.cd > 0) {
+    text(`STARTING IN ${Math.max(1, Math.ceil((300 - G.cd) / 60))}`, W / 2, 222, 34, '#c6ff00');
+    text(net.role === 'host' ? (touch ? 'press LP to start now' : 'press ENTER to start now') : 'everyone is ready', W / 2, 256, 15, '#cbb', 'center', null);
+  } else if (onl && n > 1) text('The match starts when everyone has picked', W / 2, 240, 16, '#cbb', 'center', null);
+  if (touch) text(onl ? `Pad: move   ·   LP: confirm   ·   You are player ${me + 1}` : 'Pad: move   ·   LP: confirm   ·   ☰: back', W / 2, 524, 15, '#cbb', 'center', null);
+  else text(onl ? `Move: WASD / arrows   ·   Confirm: F or ENTER   ·   ESC: leave   ·   You are player ${me + 1}`
      : arc ? 'Move: WASD / arrows   ·   Confirm: F or ENTER   ·   ESC: back'
            : 'P1: WASD + F or SPACE     ·     P2: arrows + I or ENTER     ·     ESC: back', W / 2, 524, 16, '#cbb', 'center', null);
 }
 function renderVs() {
   bg();
-  const k = Math.min(1, G.t / 25), e = 1 - Math.pow(1 - k, 3), [a, b] = G.picks;
-  face(a, lerp(-150, 230, e), 250, 130); face(b, lerp(W + 150, W - 230, e), 250, 130, true);
-  text(a.name, lerp(-150, 230, e), 420, 44, '#fff'); text(b.name, lerp(W + 150, W - 230, e), 420, 44, '#fff');
-  text(a.title, lerp(-150, 230, e), 456, 17, '#cbb', 'center', null); text(b.title, lerp(W + 150, W - 230, e), 456, 17, '#cbb', 'center', null);
-  ctx.save(); ctx.translate(W / 2, 250); ctx.scale(1 + Math.max(0, 30 - G.t) * .1, 1 + Math.max(0, 30 - G.t) * .1); text('VS', 0, 0, 120, '#ffd23f'); ctx.restore();
-  if (G.mode === 'arcade') text(`FIGHT ${G.ladderI + 1} OF ${G.ladder.length}`, W / 2, 60, 30, '#fff');
+  const k = Math.min(1, G.t / 25), e = 1 - Math.pow(1 - k, 3), P2 = G.picks, n = P2.length;
+  const pop = 1 + Math.max(0, 30 - G.t) * .1;
+  if (n <= 2) {
+    const [a, b] = P2;
+    face(a, lerp(-150, 230, e), 250, 130); face(b, lerp(W + 150, W - 230, e), 250, 130, true);
+    text(a.name, lerp(-150, 230, e), 420, 44, '#fff'); text(b.name, lerp(W + 150, W - 230, e), 420, 44, '#fff');
+    text(a.title, lerp(-150, 230, e), 456, 17, '#cbb', 'center', null); text(b.title, lerp(W + 150, W - 230, e), 456, 17, '#cbb', 'center', null);
+    ctx.save(); ctx.translate(W / 2, 250); ctx.scale(pop, pop); text('VS', 0, 0, 120, '#ffd23f'); ctx.restore();
+    if (G.mode === 'arcade') text(`FIGHT ${G.ladderI + 1} OF ${G.ladder.length}`, W / 2, 60, 30, '#fff');
+  } else {                                      // brawl: everyone lined up
+    const me = mySide(), gap = W / (n + 1), r = Math.min(64, gap * .42);
+    ctx.save(); ctx.translate(W / 2, 110); ctx.scale(pop, pop); text(`${n} PLAYER BRAWL`, 0, 0, 80, '#ffd23f'); ctx.restore();
+    P2.forEach((d, i) => {
+      const x = gap * (i + 1), y = lerp(H + 120, 300, e);
+      face(d, x, y, r, i >= n / 2);
+      text(d.name, x, y + r + 26, 24, PCOL[i]);
+      if (i === me) text('YOU', x, y - r - 18, 18, '#ffd23f');
+    });
+    text('Last one standing wins the round  ·  first to 2 rounds wins', W / 2, 480, 18, '#cbb', 'center', null);
+  }
 }
 function renderChampion() {
   bg();
@@ -1418,7 +1658,8 @@ function render() {
     case 'champion': renderChampion(); break;
   }
   if (muted) text('MUTED', W - 12, H - 60, 14, '#f66', 'right');
-  if (net.conn) text(net.via === 'relay' ? 'ONLINE · RELAY' : 'ONLINE · DIRECT', W / 2, H - 9, 11, '#9a9', 'center', null);
+  if (net.role === 'guest' && net.conn) text(net.via === 'relay' ? 'ONLINE · RELAY' : 'ONLINE · DIRECT', W / 2, H - 9, 11, '#9a9', 'center', null);
+  else if (net.role === 'host' && net.guests.length) text(`ONLINE · HOST · ${net.guests.length + 1} PLAYERS`, W / 2, H - 9, 11, '#9a9', 'center', null);
 }
 
 /* ------------------------------------------------------------------- loop */
@@ -1432,7 +1673,7 @@ function frame(t) {
 requestAnimationFrame(frame);
 
 // debugging hooks (used for automated testing)
-window.__game = { G, net, get fight() { return fight; }, keys, pressed, update, render, startFight, drawFighter, ROSTER };
+window.__game = { G, net, get fight() { return fight; }, keys, pressed, update, render, startFight, drawFighter, hostGame, joinGame, ROSTER };
 
 // An invite link (…?join=ABCD) drops the friend straight into the room.
 const invite = new URLSearchParams(location.search).get('join');
