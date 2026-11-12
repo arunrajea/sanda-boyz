@@ -6,7 +6,7 @@ const W = 960, H = 540, GROUND = 468;
 const cv = document.getElementById('game'), ctx = cv.getContext('2d');
 const ROSTER = window.ROSTER, TITLE = window.GAME_TITLE || 'SANDA BOYZ';
 const FONT = 'Impact, "Arial Black", sans-serif';
-const BUILD = 'version 14';   // shown on the title screen so you can tell which copy is loaded
+const BUILD = 'version 15';   // shown on the title screen so you can tell which copy is loaded
 const rand = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -137,6 +137,8 @@ const sfx = {
   move: () => tone(520, .04, 'square', .04),
   ok: () => { tone(660, .07, 'square', .05); tone(990, .1, 'square', .05, 0, .07); },
   back: () => tone(300, .08, 'square', .05, -100),
+  roar: () => { noise(1.4, .6, 320); tone(120, 1.3, 'sawtooth', .18, -70); tone(63, 1.4, 'square', .12, -20); },
+  flame: () => noise(.25, .3, 900),
 };
 function sayRaw(t) {
   if (muted || !window.speechSynthesis) return;
@@ -183,6 +185,7 @@ const P = {
 // Kicks move through three shapes instead of swinging a straight leg:
 // chamber (knee up, shin folded) -> extended with a slight whip -> back to chamber.
 Object.assign(P, {
+  hips:     { lean: -.1, af: [.72, -.7], ab: [-.72, .7], lf: [.3, .06], lb: [-.3, -.22] },   // hands on hips
   chamberF: { lean: -.2, af: [.5, 2.2], ab: [-.3, 1.4], lf: [1.35, -.35], lb: [-.05, -.25] },
   kick:     { lean: -.38, af: [.35, 2.0], ab: [-.8, .4], lf: [1.42, 1.64], lb: [-.08, -.3] },
   chamberB: { lean: -.3, af: [.6, 2.3], ab: [-.6, .9], lf: [-.05, -.3], lb: [1.5, -.5] },
@@ -251,6 +254,49 @@ const SPECIALS = {
     } },
 };
 
+// ULTIMATE (roster: ultimate: 'dragon'). When the fighter is beaten down to 10% health the
+// dragon awakens: from then on nothing can hurt them, and their special button summons a
+// dragon that flies across the stage breathing fire and knocks out everyone else.
+const DRAGON = { su: 45, ac: 100 };
+function dragonHead(t, dir) {
+  const p = t < DRAGON.su ? .1 * t / DRAGON.su : .1 + .95 * (t - DRAGON.su) / DRAGON.ac;
+  return [dir > 0 ? lerp(-160, W + 160, p) : lerp(W + 160, -160, p), 125 + Math.sin(p * 9) * 30];
+}
+function awaken(f) {
+  if (!f.def.ultimate || f.rage || f.hp > f.maxHp * .1) return false;
+  f.hp = f.maxHp * .1; f.rage = true; f.invuln = 30; f.stun = 0; f.move = null; f.buf = null; f.vx = 0; f.alpha = 1;
+  f.state = f.y < GROUND ? 'jump' : 'idle'; f.stateT = 0;
+  banner(`${f.def.name}'S DRAGON AWAKENS`, 'PRESS SPECIAL', 110); sfx.roar();
+  fight.shake = 12; burst(f.x, f.y - 90, '#ff7a1a', 20);
+  return true;
+}
+SPECIALS.dragon = { label: 'DRAGON', su: DRAGON.su, ac: DRAGON.ac, rc: 25, pose: 'raise', special: true,
+  frame(f) {
+    const F = fight, t = f.stateT;
+    if (t === 1) {
+      const right = F.f.filter(o => o !== f && o.hp > 0 && o.x > f.x).length, left = F.f.filter(o => o !== f && o.hp > 0 && o.x <= f.x).length;
+      F.dragon = { t: 0, dir: right >= left ? 1 : -1, side: f.side };
+      sfx.roar(); banner('DRAGON!', null, 60);
+    }
+    const D = F.dragon;
+    if (!D) return;
+    D.t = t; f.invuln = 5; F.shake = Math.max(F.shake, t < this.su ? 3 : 6);
+    if (t >= this.su && t < this.su + this.ac) {
+      if (t % 8 === 0) sfx.flame();
+      const hx = dragonHead(t, D.dir)[0];
+      for (const o of F.f) {                            // the fire reaches each opponent as the head passes over
+        if (o === f || o.hp <= 0 || (D.dir > 0 ? hx < o.x - 10 : hx > o.x + 10)) continue;
+        o.hp = 0; o.state = 'down'; o.stateT = 0; o.downT = 0; o.move = null; o.buf = null; o.alpha = 1; o.flash = 6;
+        o.vy = -11; o.vx = D.dir * 6; o.y = Math.min(o.y, GROUND - 1);
+        burst(o.x, o.y - 80, '#ff7a1a', 18); sfx.hit(true); F.shake = 13;
+      }
+    }
+    if (t >= this.su + this.ac + this.rc - 1) {         // dragon gone: "Gomma", hands on hips
+      F.dragon = null;
+      f.state = 'win'; f.stateT = 0; f.move = null; f.winPose = 'hips'; f.vx = 0;
+      banner('GOMMA!', null, 160); say('Gomma');
+    }
+  } };
 Object.assign(MOVES.lkick, { pre: 'chamberF', post: 'chamberF', trail: 'F' });
 Object.assign(MOVES.rkick, { pre: 'chamberB', post: 'chamberB', trail: 'B' });     // the roundhouse
 Object.assign(MOVES.lowkick, { pre: 'chamberL', post: 'chamberL', trail: 'F' });
@@ -271,7 +317,7 @@ function mkFighter(def, side, n = 2) {
     speed: 3 + def.speed * .5, power: .7 + def.power * .1, maxHp: hp, hp, lagHp: hp, energy: 50,
     state: 'idle', stateT: 0, move: null, hits: [], stun: 0, invuln: 0, alpha: 1,
     combo: 0, comboT: 0, buf: null, inp: EMPTY, backHeld: false, threat: false, crouchB: false,
-    walkT: 0, downT: 0, flash: 0, fresh: true, gone: false, out: false, tgt: null, pose: clonePose(P.idle) };
+    walkT: 0, downT: 0, flash: 0, fresh: true, gone: false, out: false, tgt: null, rage: false, ultUsed: false, winPose: 0, pose: clonePose(P.idle) };
 }
 const controllable = f => f.state === 'idle' || f.state === 'walk' || f.state === 'crouch' || f.state === 'block';
 const isCrouch = f => f.state === 'crouch' || (f.state === 'block' && f.crouchB) || (f.state === 'attack' && f.move.duck && f.y >= GROUND);
@@ -302,6 +348,7 @@ function threatTo(f) {
 }
 
 function applyHit(att, def, m, dir, px, py) {
+  if (def.rage) { burst(px, py, '#ffb300', 5); sfx.block(); return true; }     // awakened: nothing hurts
   if (def.invuln > 0 || def.state === 'down' || def.state === 'getup') return false;
   const cr = isCrouch(def);
   // blocking only works against attacks coming from the front
@@ -309,6 +356,7 @@ function applyHit(att, def, m, dir, px, py) {
     (m.h === 'low' ? cr : m.h === 'over' ? !cr : true);
   if (canBlock) {
     def.hp = Math.max(1, def.hp - m.dmg * .08);
+    if (awaken(def)) return true;
     def.state = 'block'; def.stateT = 0; def.crouchB = cr; def.stun = 13; def.vx = dir * 4;
     att.energy = Math.min(100, att.energy + 3);
     sfx.block(); burst(px, py, '#9cf', 6);
@@ -317,6 +365,7 @@ function applyHit(att, def, m, dir, px, py) {
   att.combo = def.state === 'hit' ? att.combo + 1 : 1; att.comboT = 100;
   const dmg = m.dmg * att.power * Math.max(.4, 1 - .12 * (att.combo - 1));
   def.hp = Math.max(0, def.hp - dmg);
+  if (awaken(def)) { sfx.hit(true); return true; }
   att.energy = Math.min(100, att.energy + 8); def.energy = Math.min(100, def.energy + 5);
   def.move = null; def.alpha = 1; def.flash = 6; def.buf = null;
   if (m.knock || def.y < GROUND || def.hp <= 0) {
@@ -346,7 +395,8 @@ function updateFighter(f, o) {
   if (btn) f.buf = { k: btn, t: 8 };
   else if (f.buf && --f.buf.t <= 0) f.buf = null;
   let want = f.buf && f.buf.k;
-  if (want === 's' && f.energy < 50) { want = null; f.buf = null; }
+  const ult = f.rage && !f.ultUsed;                 // dragon is ready: the special button needs no energy
+  if (want === 's' && f.energy < 50 && !ult) { want = null; f.buf = null; }
 
   if (controllable(f)) {
     if (f.stun > 0) { f.stun--; f.vx *= .8; f.backHeld = f.facing > 0 ? inp.l : inp.r; }
@@ -354,7 +404,8 @@ function updateFighter(f, o) {
       f.facing = o.x >= f.x ? 1 : -1;
       const fwd = f.facing > 0 ? inp.r : inp.l, back = f.facing > 0 ? inp.l : inp.r;
       f.backHeld = back; f.threat = back && threatTo(f);
-      if (want === 's') { f.energy -= 50; startMove(f, f.def.special); }
+      if (want === 's' && ult) { f.ultUsed = true; startMove(f, 'dragon'); }
+      else if (want === 's') { f.energy -= 50; startMove(f, f.def.special); }
       else if (want) startMove(f, (inp.d ? DUCK : STAND)[want]);
       else if (inp.u) {
         setState(f, 'jump'); f.vy = -15.5; f.y -= 1; sfx.jump();
@@ -436,7 +487,7 @@ function targetPose(f) {
     case 'hit': return P.hit;
     case 'down': return f.y < GROUND ? P.fall : P.lying;
     case 'getup': return P.crouch;
-    case 'win': return P.win;
+    case 'win': return f.winPose ? P[f.winPose] : P.win;
   }
   return P.idle;
 }
@@ -492,6 +543,7 @@ function aiInput(f, o, ai) {
   const inp = { l: 0, r: 0, u: 0, d: 0, lp: 0, rp: 0, lk: 0, rk: 0, s: 0 };
   const sk = ai.skill, dx = o.x - f.x, dist = Math.abs(dx), tw = dx > 0 ? 'r' : 'l', aw = dx > 0 ? 'l' : 'r';
   const sp = f.def.special, canSp = f.energy >= 50;
+  if (f.rage && !f.ultUsed) { inp.s = fight.tick % 20 === 0 ? 1 : 0; return inp; }   // computer player: unleash it
   if (ai.seq.length) {                       // running a combo string
     if (controllable(f) && f.stun <= 0) { inp[ai.seq.shift()] = 1; if (o.state !== 'hit' && o.state !== 'block') ai.seq.length = 0; }
     return inp;
@@ -761,9 +813,9 @@ function hostGame() {
 function snapshot(ev) {
   const F = fight;
   return { t: 's', pk: pkIdx(), ids: F.pid, lob: lobbyIds(), ev,
-    F: { round: F.round, phase: F.phase, timer: F.timer, tick: F.tick, stage: F.stage, banner: F.banner, menu: F.menu, shake: F.shake, wins: F.wins, hitstop: F.hitstop },
+    F: { round: F.round, phase: F.phase, timer: F.timer, tick: F.tick, stage: F.stage, banner: F.banner, menu: F.menu, shake: F.shake, wins: F.wins, hitstop: F.hitstop, dragon: F.dragon },
     f: F.f.map(f => ({ x: f.x, y: f.y, vx: f.vx, vy: f.vy, facing: f.facing, state: f.state, stateT: f.stateT, mv: f.move ? f.move.name : 0,
-      hp: f.hp, energy: f.energy, alpha: f.alpha, flash: f.flash, combo: f.combo, crouchB: +f.crouchB, threat: +f.threat, walkT: f.walkT })),
+      hp: f.hp, energy: f.energy, alpha: f.alpha, flash: f.flash, combo: f.combo, crouchB: +f.crouchB, threat: +f.threat, walkT: f.walkT, rage: +f.rage, ultUsed: +f.ultUsed, winPose: f.winPose })),
     proj: F.proj.map(p => ({ kind: p.kind, x: p.x, y: p.y, vx: p.vx, color: p.color, life: p.life, t: p.t })) };
 }
 function hostSend() {
@@ -913,6 +965,7 @@ function guestTick() {
     mixPose(f.pose, targetPose(f), poseRate(f)); f.lagHp = Math.max(f.hp, f.lagHp - .35);
   }
   if (!frozen) for (const p of F.proj) { p.x += p.vx; p.t++; }
+  if (!frozen && F.dragon) F.dragon.t++;
 }
 function inviteLink() {
   if (!/^https?:$/.test(location.protocol) || /^(localhost|127\.|\[::1\])/.test(location.hostname)) return null;
@@ -953,13 +1006,13 @@ function startFight(defs, pids) {
   const skill = clamp(G.diff * .3 + (G.mode === 'arcade' ? G.ladderI * .05 : .1), 0, 1);
   fight = { defs: vd, pid: pids || ['p1', 'p2'], n, f: vd.map((d, i) => mkFighter(d, i, n)), wins: Array(n).fill(0), round: 1, phase: 'intro', phaseT: 0,
     timer: n > 2 ? 90 : 60, tick: 0, proj: [], sparks: [], stage: (rand(STAGES.length)) | 0, banner: null, paused: false, menu: 0,
-    hitstop: 0, shake: 0, winner: -1, ai: { t: 20, act: 'idle', seq: [], skill, airT: 0 } };
+    hitstop: 0, shake: 0, winner: -1, dragon: null, ai: { t: 20, act: 'idle', seq: [], skill, airT: 0 } };
   G.scene = 'fight';
 }
 function newRound() {
   const F = fight;
   F.f = F.defs.map((d, i) => mkFighter(d, i, F.n));
-  F.phase = 'intro'; F.phaseT = 0; F.timer = F.n > 2 ? 90 : 60; F.proj = []; F.sparks = []; F.winner = -1; F.banner = null;
+  F.phase = 'intro'; F.phaseT = 0; F.timer = F.n > 2 ? 90 : 60; F.proj = []; F.sparks = []; F.winner = -1; F.banner = null; F.dragon = null;
   F.ai.t = 20; F.ai.act = 'idle'; F.ai.seq = [];
 }
 function banner(s, sub, dur = 90) { fight.banner = { s, sub, t0: fight.tick, dur }; }
@@ -1453,6 +1506,16 @@ function drawFighter(f) {
   ctx.fillStyle = 'rgba(0,0,0,.35)';
   const sw = 46 - Math.min(26, (GROUND - f.y) * .12);
   ctx.beginPath(); ctx.ellipse(f.x, GROUND + 6, sw, 8, 0, 0, 7); ctx.fill();
+  if (f.rage && !f.ultUsed && f.hp > 0) {             // awakened: wrapped in flames
+    const tk = fight.tick;
+    for (const [colr, sc] of [['rgba(255,90,20,.38)', 1], ['rgba(255,210,60,.42)', .62]]) {
+      ctx.fillStyle = colr;
+      for (let q = -3; q <= 3; q++) {
+        const fx = f.x + q * 12, fh = (150 + 34 * Math.sin(tk * .31 + q * 1.7)) * sc * (1 - Math.abs(q) * .09);
+        ctx.beginPath(); ctx.moveTo(fx - 11, f.y + 5); ctx.quadraticCurveTo(fx - 9, f.y - fh * .5, fx + Math.sin(tk * .2 + q) * 7, f.y - fh); ctx.quadraticCurveTo(fx + 9, f.y - fh * .5, fx + 11, f.y + 5); ctx.fill();
+      }
+    }
+  }
   const tr = f.trail || (f.trail = []), mv = f.move;
   const foot0 = f.state === 'attack' && mv && mv.trail && f.stateT >= mv.su - 3 && f.stateT < mv.su + mv.ac + 3 ? (mv.trail === 'B' ? S.fB : S.fF) : null;
   if (foot0) tr.push([f.x + f.facing * foot0[0], hipY + foot0[1]]); else if (tr.length) tr.splice(0, 2);
@@ -1693,6 +1756,53 @@ function drawHudBrawl() {
   const mf = F.f[me];
   if (mf && mf.combo > 1) text(`${mf.combo} HIT COMBO!`, W / 2, 124, 26, '#ffd23f');
 }
+// The dragon: a long body trailing along the path its head has flown, breathing fire at the ground.
+function drawDragon(D) {
+  const t = D.t, dir = D.dir, firing = t >= DRAGON.su && t < DRAGON.su + DRAGON.ac;
+  ctx.save();
+  ctx.fillStyle = 'rgba(50,0,0,.38)'; ctx.fillRect(-20, -20, W + 40, H + 40);
+  const [hx, hy] = dragonHead(t, dir), edge = dir > 0 ? 0 : W;
+  // ground left burning behind the head
+  if (t >= DRAGON.su) for (let x = Math.min(edge, hx); x <= Math.max(edge, hx); x += 22) {
+    const fade = clamp(1 - Math.abs(hx - x) / 700, .25, 1), h = (26 + 20 * Math.sin(x * .31 + t * .5)) * fade;
+    ctx.fillStyle = `rgba(255,110,20,${(.75 * fade).toFixed(2)})`;
+    ctx.beginPath(); ctx.moveTo(x - 13, GROUND + 8); ctx.quadraticCurveTo(x - 6, GROUND - h * .6, x + Math.sin(t * .4 + x) * 5, GROUND - h); ctx.quadraticCurveTo(x + 6, GROUND - h * .6, x + 13, GROUND + 8); ctx.fill();
+    ctx.fillStyle = `rgba(255,225,90,${(.8 * fade).toFixed(2)})`;
+    ctx.beginPath(); ctx.moveTo(x - 6, GROUND + 8); ctx.lineTo(x + Math.sin(t * .4 + x) * 3, GROUND - h * .55); ctx.lineTo(x + 6, GROUND + 8); ctx.fill();
+  }
+  // body, tail first
+  for (let i = 30; i >= 1; i--) {
+    const [x, y] = dragonHead(t - i * 3, dir), r = Math.max(5, 26 - i * .72), wob = Math.sin(t * .25 + i * .7) * 3;
+    ctx.beginPath(); ctx.arc(x, y + wob, r + 3, 0, 7); ctx.fillStyle = '#2a0404'; ctx.fill();
+    if (i % 2 === 0) { ctx.beginPath(); ctx.moveTo(x - 7, y + wob - r + 3); ctx.lineTo(x - dir * 4, y + wob - r - 13); ctx.lineTo(x + 7, y + wob - r + 3); ctx.fillStyle = '#ffd23f'; ctx.fill(); }
+    ctx.beginPath(); ctx.arc(x, y + wob, r, 0, 7); ctx.fillStyle = i % 2 ? '#c62828' : '#a31515'; ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y + wob + r * .45, r * .5, 0, 7); ctx.fillStyle = '#ffb300'; ctx.fill();
+  }
+  // fire from the mouth down to the ground
+  const mx = hx + dir * 54, my = hy + 44;
+  if (firing) for (const [colr, w] of [['rgba(255,70,10,.75)', 86], ['rgba(255,150,30,.85)', 56], ['rgba(255,240,150,.95)', 26]]) {
+    const j = Math.sin(t * .9 + w) * 10, gx = mx + dir * 46;
+    ctx.fillStyle = colr; ctx.beginPath(); ctx.moveTo(mx - 6, my - 4); ctx.lineTo(mx + 6, my + 4);
+    ctx.quadraticCurveTo(gx + w * .7 + j, (my + GROUND) / 2, gx + w + j, GROUND + 8); ctx.lineTo(gx - w + j, GROUND + 8);
+    ctx.quadraticCurveTo(gx - w * .7 + j, (my + GROUND) / 2, mx - 6, my - 4); ctx.fill();
+  }
+  // head
+  ctx.translate(hx, hy); ctx.scale(dir, 1); ctx.rotate(.35);
+  const part = (pts, fill) => { ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.fillStyle = fill; ctx.fill(); ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.strokeStyle = '#2a0404'; ctx.stroke(); };
+  part([[-8, -20], [-56, -52], [-22, -8]], '#ffd23f'); part([[4, -22], [-30, -62], [14, -14]], '#ffd23f');                 // horns
+  part([[-30, -6], [-52, -22], [-34, 4], [-56, 8], [-32, 14]], '#ff7a1a');                                                  // mane
+  part([[16, 12], [60, 34], [54, 42], [10, 26]], '#a31515');                                                                // lower jaw
+  ctx.beginPath(); ctx.ellipse(0, 0, 38, 26, 0, 0, 7); ctx.fillStyle = '#c62828'; ctx.fill(); ctx.stroke();
+  part([[18, -16], [70, -8], [76, 6], [70, 14], [18, 16]], '#c62828');                                                      // snout
+  ctx.fillStyle = '#fff'; for (let x = 26; x < 68; x += 10) { ctx.beginPath(); ctx.moveTo(x, 14); ctx.lineTo(x + 4, 24); ctx.lineTo(x + 8, 14); ctx.fill(); }
+  ctx.beginPath(); ctx.ellipse(14, -8, 9, 7, -.2, 0, 7); ctx.fillStyle = '#ffe14d'; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(15, -8, 2.2, 6, -.2, 0, 7); ctx.fillStyle = '#111'; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(2, -17); ctx.lineTo(26, -12); ctx.lineWidth = 4; ctx.stroke();                                // brow
+  ctx.beginPath(); ctx.arc(66, -3, 2.5, 0, 7); ctx.fillStyle = '#2a0404'; ctx.fill();
+  ctx.lineWidth = 2.5; ctx.strokeStyle = '#ffd23f';                                                                         // whiskers
+  for (const k of [-1, 1]) { ctx.beginPath(); ctx.moveTo(62, 2); ctx.quadraticCurveTo(84, k * 10 + Math.sin(t * .3) * 5, 70, k * 30 + 6); ctx.stroke(); }
+  ctx.restore();
+}
 function drawMenuBox(title, opts, sel, sub) {
   ctx.fillStyle = 'rgba(0,0,0,.65)'; ctx.fillRect(0, 0, W, H);
   text(title, W / 2, 150, title.length > 14 ? 54 : 72, '#ffd23f');
@@ -1715,7 +1825,13 @@ function renderFight() {
     if (f.hp <= 0) return;
     text(i === me ? '▼ YOU' : f.def.name, f.x, f.y - 214, i === me ? 15 : 12, i === me ? '#ffd23f' : PCOL[i]);
   });
+  F.f.forEach((f, i) => {                       // prompt over an awakened fighter
+    if (!f.rage || f.ultUsed || f.hp <= 0 || F.tick % 40 > 26) return;
+    if (G.mode === 'online' && i !== me) return;
+    text(touch ? 'DRAGON READY — PRESS SP' : 'DRAGON READY — PRESS SPECIAL', clamp(f.x, 150, W - 150), f.y - 240, 16, '#ffd23f');
+  });
   F.proj.forEach(drawProj);
+  if (F.dragon) drawDragon(F.dragon);
   for (const s of F.sparks) {
     ctx.globalAlpha = clamp(s.life / s.max, 0, 1);
     if (s.ring) { ctx.strokeStyle = s.color; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(s.x, s.y, s.size * (1.2 - s.life / s.max), 0, 7); ctx.stroke(); }
@@ -1829,7 +1945,7 @@ function previewPanel(d, side, label, locked, col) {
   if (!d) return;
   text(d.name, tx, 226, 34, locked ? '#ffd23f' : '#fff', al);
   text(d.title, tx, 254, 15, '#cbb', al, null);
-  text(SPECIALS[d.special].label, tx, 274, 15, d.accent, al);
+  text(SPECIALS[d.special].label + (d.ultimate ? '   +   DRAGON AT 10% HEALTH' : ''), tx, 274, 15, d.accent, al);
 }
 function renderSelect() {
   bg();
