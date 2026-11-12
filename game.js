@@ -6,6 +6,7 @@ const W = 960, H = 540, GROUND = 468;
 const cv = document.getElementById('game'), ctx = cv.getContext('2d');
 const ROSTER = window.ROSTER, TITLE = window.GAME_TITLE || 'SANDA BOYZ';
 const FONT = 'Impact, "Arial Black", sans-serif';
+const BUILD = 'version 14';   // shown on the title screen so you can tell which copy is loaded
 const rand = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -1782,6 +1783,7 @@ function bg() {
 }
 function renderTitle() {
   bg();
+  text(BUILD, W - 12, 14, 12, '#a99', 'right', null);
   ROSTER.forEach((d, i) => face(d, 66 + i * 92, 500 + Math.sin(G.t * .05 + i) * 4, 30, i >= ROSTER.length / 2));
   ctx.save(); ctx.translate(W / 2, 120); ctx.rotate(-.04);
   text(TITLE, 4, 5, 108, '#000', 'center', null); text(TITLE, 0, 0, 108, '#ffd23f');
